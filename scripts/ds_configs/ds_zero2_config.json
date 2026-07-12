@@ -12,7 +12,7 @@
     },
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "reduce_bucket_size": 2e8,
-    "allgather_bucket_size": 2e8
+    "reduce_bucket_size": 5e8,
+    "allgather_bucket_size": 5e8
   }
 }
