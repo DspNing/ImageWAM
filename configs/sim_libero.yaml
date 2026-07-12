@@ -41,6 +41,7 @@ EVALUATION:
 
   # Optional external inputs
   dataset_stats_path: null
+  text_cache_dir: null
   device: cuda
 
 MULTIRUN:

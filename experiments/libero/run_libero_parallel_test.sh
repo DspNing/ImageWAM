@@ -24,7 +24,7 @@ run_libero_eval() {
     export RUN_ID
     OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT_DIR/evaluate_results/$RUN_ID"}
     export OUTPUT_DIR  # Use run_id as the output subdirectory
-    SESSION_NAME=${SESSION_NAME:-"libero_test_v3_${RUN_ID}_$$"}
+    SESSION_NAME=${SESSION_NAME:-"libero_test_v3"}
     EXP_NAME=${EXP_NAME:-""}
     export EXP_NAME
     MUJOCO_GL=${MUJOCO_GL:-osmesa}
@@ -356,6 +356,7 @@ run_libero_eval() {
         local log_file="$TASK_LOG_DIR/${chunk_id}_${first_suite}_task${first_task_id}_gpu${gpu_id}.log"
         local worker_env_cmd=""
         local worker_pythonpath_cmd=""
+        local worker_python_cmd="${CONDA_ENV_PYTHON:-python}"
         if [ -n "$WORKER_ENV_SOURCE" ]; then
             worker_env_cmd="source $WORKER_ENV_SOURCE && "
         fi
@@ -380,11 +381,17 @@ run_libero_eval() {
         if ! tmux send-keys -t "$tmux_target" "${worker_env_cmd}cd $ROOT_DIR && export EXP_NAME=$EXP_NAME MUJOCO_GL=$MUJOCO_GL PYOPENGL_PLATFORM=$PYOPENGL_PLATFORM && \
             ${worker_pythonpath_cmd} \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' && \
-            CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
+            CUDA_VISIBLE_DEVICES=$gpu_id ${worker_python_cmd} experiments/libero/eval_libero_single.py \
             --config-name $CONFIG_NAME \
             task=$CONFIG ckpt=$CKPT \
-            EVALUATION.task_chunk_file='$chunk_file' EVALUATION.task_suite_name=$first_suite EVALUATION.task_id=$first_task_id gpu_id=$gpu_id \
-            EVALUATION.num_trials=$NUM_TRIALS EVALUATION.output_dir=$OUTPUT_DIR $EXTRA_ARGS > \"\$LOG_FILE\" 2>&1; \
+            EVALUATION.task_chunk_file='$chunk_file' \
+            EVALUATION.task_suite_name=$first_suite \
+            EVALUATION.task_id=$first_task_id gpu_id=$gpu_id \
+            EVALUATION.num_trials=$NUM_TRIALS \
+            EVALUATION.output_dir=$OUTPUT_DIR \
+            ${TEXT_CACHE_DIR:+EVALUATION.text_cache_dir=$TEXT_CACHE_DIR} \
+            ${TEXT_CACHE_DIR:+model.load_text_encoder=false} \
+            $EXTRA_ARGS > \"\$LOG_FILE\" 2>&1; \
             rc=\$?; \
             if [ \$rc -eq 0 ]; then \
                 echo \"SUCCESS|$gpu_id|\$rc|\$(date +%s)|\$LOG_FILE\" > \"\$STATUS_FILE\"; \

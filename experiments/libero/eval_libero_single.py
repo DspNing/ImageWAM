@@ -511,6 +511,75 @@ def _compute_clip_mean_psnr(
     return float(np.mean(frame_psnr_values))
 
 
+def _load_text_cache(cache_dir: str) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Load precomputed text embeddings from cache directory.
+
+    Cache files follow the naming convention:
+        {sha256(prompt)}.qwen3_flux2_len{context_len}.pt
+    or
+        {sha256(prompt)}.t5_len{context_len}.{enc_id}.pt  (FastWAM/T5 format)
+
+    Returns a dict mapping prompt -> (context_tensor, mask_tensor) on CPU.
+    """
+    import hashlib
+    from pathlib import Path
+
+    cache_path = Path(cache_dir)
+    if not cache_path.exists():
+        return {}
+
+    cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    suffixes = [".qwen3_flux2_len", ".t5_len"]
+    for pt_file in cache_path.glob("*.pt"):
+        pt_name = pt_file.name
+        # Extract hash prefix (everything before the first dot after .pt start)
+        for suffix in suffixes:
+            idx = pt_name.find(suffix)
+            if idx > 0:
+                hashed = pt_name[:idx]
+                try:
+                    payload = torch.load(pt_file, map_location="cpu", weights_only=False)
+                    # Support both formats:
+                    # qwen3_flux2: {"text_hidden_states": ..., "text_attention_mask": ...}
+                    # t5: {"context": ..., "mask": ...}
+                    if "text_hidden_states" in payload:
+                        ctx = payload["text_hidden_states"]
+                        msk = payload["text_attention_mask"]
+                    elif "context" in payload:
+                        ctx = payload["context"]
+                        msk = payload["mask"]
+                    else:
+                        continue
+                    cache[hashed] = (ctx, msk)
+                except Exception as exc:
+                    logging.debug("Failed to load cache file %s: %s", pt_file, exc)
+                break
+    logging.info("Loaded %d text embeddings from cache: %s", len(cache), cache_dir)
+    return cache
+
+
+def _get_cached_context(
+    prompt: str,
+    text_cache: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    device: str,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Look up a prompt's precomputed context in the text cache.
+
+    Returns (context, mask) on *device*, or None if not found.
+    """
+    import hashlib
+
+    hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    entry = text_cache.get(hashed)
+    if entry is None:
+        return None
+    ctx, msk = entry
+    return ctx.to(device=device, dtype=dtype, non_blocking=True), msk.to(
+        device=device, dtype=torch.bool, non_blocking=True
+    )
+
+
 def _predict_action_chunk(
     obs: dict,
     task_description: str,
@@ -522,6 +591,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -541,8 +611,8 @@ def _predict_action_chunk(
         dtype=model.torch_dtype,
     )
 
-    infer_kwargs = {
-        "prompt": prompt,
+    infer_kwargs: dict[str, Any] = {
+        "prompt": None,  # always set; overridden below if needed
         "input_image": image,
         "action_horizon": action_horizon,
         "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
@@ -558,6 +628,21 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+
+    # Use precomputed text embeddings if available (saves VRAM by skipping text encoder)
+    if text_cache is not None:
+        cached = _get_cached_context(prompt, text_cache, model_device, model.torch_dtype)
+        if cached is not None:
+            context, context_mask = cached
+            infer_kwargs["context"] = context
+            infer_kwargs["context_mask"] = context_mask
+            logging.debug("Used text cache for prompt: %s", prompt[:60])
+        else:
+            infer_kwargs["prompt"] = prompt
+            logging.debug("Text cache miss for prompt: %s", prompt[:60])
+    else:
+        infer_kwargs["prompt"] = prompt
+
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -610,6 +695,7 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
@@ -653,6 +739,7 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                text_cache=text_cache,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -749,6 +836,7 @@ def run_single_task(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> dict:
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
@@ -867,6 +955,12 @@ def eval_single_process(cfg: DictConfig):
     _load_model_checkpoint(model, str(ckpt_path))
     model = model.to(model_device).eval()
 
+    # Load text embedding cache if configured (saves VRAM by skipping text encoder)
+    text_cache_dir = cfg.EVALUATION.get("text_cache_dir", None)
+    text_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
+    if text_cache_dir is not None and str(text_cache_dir).strip():
+        text_cache = _load_text_cache(str(text_cache_dir))
+
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
     processor: ImageWAMProcessor = instantiate(cfg.data.train.processor).eval()
@@ -940,7 +1034,7 @@ def eval_single_process(cfg: DictConfig):
             len(all_results) + 1,
             len(task_choices),
         )
-        task_results = run_single_task(
+        results = run_single_task(
             task=task,
             initial_states=initial_states,
             model=model,
@@ -952,8 +1046,8 @@ def eval_single_process(cfg: DictConfig):
             input_w=input_w,
             input_h=input_h,
             model_device=model_device,
+            text_cache=text_cache,
         )
-        results.update(task_results)
 
         results["duration"] = time.time() - (task_start_time if chunk_mode else start_time)
         output_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name

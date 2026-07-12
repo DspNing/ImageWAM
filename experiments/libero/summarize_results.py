@@ -48,8 +48,34 @@ def summarize_results(output_dir):
     task_results = {}
     has_psnr_metric = False
     
-    # Iterate over all suite directories
-    for suite in ["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"]:
+    # LIBERO-PRO OOD suite categories
+    ood_categories = {
+        'swap': ['libero_goal_swap', 'libero_spatial_swap', 'libero_10_swap', 'libero_object_swap'],
+        'object': ['libero_goal_object', 'libero_spatial_object', 'libero_10_object', 'libero_object_object'],
+        'lan': ['libero_goal_lan', 'libero_spatial_lan', 'libero_10_lan', 'libero_object_lan'],
+        'task': ['libero_goal_task', 'libero_spatial_task', 'libero_10_task', 'libero_object_task'],
+        'env': ['libero_goal_env', 'libero_spatial_env', 'libero_10_env', 'libero_object_env'],
+    }
+
+    # Store per-category stats
+    category_stats = {}
+    for cat_name, suites in ood_categories.items():
+        category_stats[cat_name] = {
+            'total_tasks': 0,
+            'total_trials': 0,
+            'total_successes': 0,
+            'total_time': 0,
+            'max_time': 0,
+            'psnr_sum': 0.0,
+            'psnr_count': 0,
+            'suites': {},
+        }
+
+    # Iterate over all suite directories (original + OOD)
+    all_suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"]
+    all_suites.extend(sum(ood_categories.values(), []))
+
+    for suite in all_suites:
         suite_dir = os.path.join(output_dir, suite)
         if not os.path.exists(suite_dir):
             continue
@@ -101,12 +127,13 @@ def summarize_results(output_dir):
     print("\n=== Evaluation Results Summary ===")
     print("\nStatistics for each task suite:")
     
-    total_success_rate = 0
+    total_successes_all = 0
+    total_trials_all = 0
     total_time = 0
     total_suites = 0
     overall_psnr_sum = 0.0
     overall_psnr_count = 0
-    
+
     # Prepare DataFrame rows
     df_data = {
         'Task Suite': [],
@@ -116,7 +143,7 @@ def summarize_results(output_dir):
     }
     if has_psnr_metric:
         df_data['Average Future PSNR (dB)'] = []
-    
+
     for suite, stats in suite_stats.items():
         if stats['total_trials'] > 0:
             success_rate = stats['total_successes'] / stats['total_trials'] * 100
@@ -129,7 +156,7 @@ def summarize_results(output_dir):
                     if stats['psnr_count'] > 0
                     else None
                 )
-            
+
             print(f"\n{suite}:")
             print(f"- Tasks completed: {stats['total_tasks']}")
             print(f"- Total attempts: {stats['total_trials']}")
@@ -143,7 +170,7 @@ def summarize_results(output_dir):
                     print(f"- Average future-video PSNR: {suite_avg_psnr:.4f} dB")
                 else:
                     print("- Average future-video PSNR: N/A")
-            
+
             # Append to DataFrame rows
             df_data['Task Suite'].append(suite)
             df_data['Success Rate (%)'].append(f"{success_rate:.2f}")
@@ -153,24 +180,25 @@ def summarize_results(output_dir):
                 df_data['Average Future PSNR (dB)'].append(
                     f"{suite_avg_psnr:.4f}" if suite_avg_psnr is not None else "N/A"
                 )
-            
-            total_success_rate += success_rate
+
+            total_successes_all += stats['total_successes']
+            total_trials_all += stats['total_trials']
             total_time += stats['total_time']
             total_suites += 1
             if has_psnr_metric:
                 overall_psnr_sum += stats['psnr_sum']
                 overall_psnr_count += stats['psnr_count']
-    
+
     if total_suites > 0:
         print("\nOverall statistics:")
-        avg_success_rate = total_success_rate/total_suites
-        avg_task_time = total_time/sum(s['total_tasks'] for s in suite_stats.values())
+        overall_success_rate = total_successes_all / total_trials_all * 100
+        avg_task_time = total_time / sum(s['total_tasks'] for s in suite_stats.values())
         max_task_time = max(s['max_time'] for s in suite_stats.values())
         overall_avg_psnr = None
         if has_psnr_metric:
             overall_avg_psnr = overall_psnr_sum / overall_psnr_count if overall_psnr_count > 0 else None
-        
-        print(f"- Average success rate: {avg_success_rate:.2f}%")
+
+        print(f"- Overall success rate (weighted by trials): {overall_success_rate:.2f}%")
         print(f"- Total time: {format_time(total_time)}")
         print(f"- Average time per task: {format_time(avg_task_time)}")
         print(f"- Longest task time: {format_time(max_task_time)}")
@@ -179,10 +207,10 @@ def summarize_results(output_dir):
                 print(f"- Average future-video PSNR: {overall_avg_psnr:.4f} dB")
             else:
                 print("- Average future-video PSNR: N/A")
-        
+
         # Add an overall summary row
         df_data['Task Suite'].append('Overall')
-        df_data['Success Rate (%)'].append(f"{avg_success_rate:.2f}")
+        df_data['Success Rate (%)'].append(f"{overall_success_rate:.2f}")
         df_data['Average Time (s)'].append(f"{avg_task_time:.2f}")
         df_data['Max Time (s)'].append(f"{max_task_time:.2f}")
         if has_psnr_metric:
@@ -260,9 +288,9 @@ def summarize_results(output_dir):
     # Save the detailed JSON summary
     summary_file = os.path.join(output_dir, 'summary.json')
     overall_stats = {
-        'average_success_rate': total_success_rate/total_suites if total_suites > 0 else 0,
+        'average_success_rate': total_successes_all / total_trials_all * 100 if total_trials_all > 0 else 0,
         'total_time': total_time,
-        'average_task_time': total_time/sum(s['total_tasks'] for s in suite_stats.values()) if suite_stats else 0,
+        'average_task_time': total_time / sum(s['total_tasks'] for s in suite_stats.values()) if suite_stats else 0,
     }
     if has_psnr_metric:
         overall_stats['average_future_video_psnr'] = (
