@@ -14,14 +14,14 @@ data:
 
 batch_size: 10
 num_workers: 24
-prefetch_factor: 2
+prefetch_factor: 4
 persistent_workers: true
 
 learning_rate: 1e-4
 num_epochs: 10
 max_steps: null
 log_every: 10
-save_every: 1000
+save_every: 2000
 eval_every: 1000
 eval_num_samples: 8
 keep_latest_state_only: true

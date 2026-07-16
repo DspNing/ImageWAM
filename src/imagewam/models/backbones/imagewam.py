@@ -1682,12 +1682,26 @@ class ImageWAM(torch.nn.Module):
             raise ValueError(f"`image` must be [B,3,H,W] or [3,H,W], got {tuple(image.shape)}")
         if image.shape[-2] % 16 != 0 or image.shape[-1] % 16 != 0:
             raise ValueError(f"FLUX.2 image spatial dims must be multiples of 16, got {tuple(image.shape[-2:])}")
-        image = image.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        latents = self.vae.encode(image).to(dtype=self.torch_dtype)
-        tokens = Flux2VideoExpert.pack_latents(latents)
-        _, _, latent_h, latent_w = latents.shape
+
+        # Batched encoding with chunking for memory efficiency
+        B = image.shape[0]
+        vae_chunk = getattr(self, "encode_batch_chunk", 10)
+
+        all_tokens = []
+        all_latent_shapes = []
+
+        for i in range(0, B, vae_chunk):
+            chunk = image[i:i + vae_chunk].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            latents = self.vae.encode(chunk).to(dtype=self.torch_dtype)
+            tokens = Flux2VideoExpert.pack_latents(latents)
+            all_tokens.append(tokens)
+            all_latent_shapes.append(latents.shape[-2:])  # (latent_h, latent_w)
+
+        tokens = torch.cat(all_tokens, dim=0)
+        # Use shape from first chunk (assuming uniform sizes)
+        latent_h, latent_w = all_latent_shapes[0]
         ids = Flux2VideoExpert.build_img_ids(
-            batch_size=int(latents.shape[0]),
+            batch_size=B,
             token_height=int(latent_h),
             token_width=int(latent_w),
             time_value=float(time_value),
@@ -1702,9 +1716,20 @@ class ImageWAM(torch.nn.Module):
 
         latent_h = int(height) // 16
         latent_w = int(width) // 16
-        latents = Flux2VideoExpert.unpack_latents(tokens, latent_h, latent_w)
-        image = self.vae.decode(latents.to(device=self.device, dtype=self.torch_dtype))
-        return image.detach().float().clamp(-1, 1)
+
+        # Batched decoding with chunking for memory efficiency
+        B = tokens.shape[0]
+        vae_chunk = getattr(self, "decode_batch_chunk", 10)
+
+        all_images = []
+
+        for i in range(0, B, vae_chunk):
+            chunk_tokens = tokens[i:i + vae_chunk]
+            chunk_latents = Flux2VideoExpert.unpack_latents(chunk_tokens, latent_h, latent_w)
+            chunk_image = self.vae.decode(chunk_latents.to(device=self.device, dtype=self.torch_dtype))
+            all_images.append(chunk_image.detach().float().clamp(-1, 1))
+
+        return torch.cat(all_images, dim=0)
 
     @torch.no_grad()
     def _encode_flux2_text(self, sample) -> tuple[torch.Tensor, torch.Tensor]:

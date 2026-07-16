@@ -1,14 +1,18 @@
 train:
   _target_: imagewam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
-  dataset_dirs: ???
+  dataset_dirs:
+    - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot
   shape_meta:
     images:
       - key: image
         raw_shape: [3, 512, 512]
-        shape: [3, 224, 224]
+        shape: [3, 112, 112]
       - key: wrist_image
         raw_shape: [3, 512, 512]
-        shape: [3, 224, 224]
+        shape: [3, 112, 112]
     action:
       - key: default
         raw_shape: 7
@@ -20,7 +24,7 @@ train:
   num_frames: 17
   global_sample_stride: 1
   action_video_freq_ratio: 1
-  video_size: [224, 448]
+  video_size: [112, 224]
   camera_key: null
   val_set_proportion: 0.0
   is_training_set: true
@@ -71,10 +75,19 @@ train:
     train_transforms:
       - _target_: imagewam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [224, 224]
+        size: [112, 112]
     val_transforms:
       - _target_: imagewam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [224, 224]
+        size: [112, 112]
   text_embedding_cache_dir: null
   context_len: 128
+  # Pre-cached normalized action/proprio (skips parquet + processor)
+  # null = read action/proprio from parquet on the fly
+  # action_proprio_cache_path: null
+  action_proprio_cache_path: ./data/action_proprio_cache/libero.pt
+  # Pre-cached video frames (uint8, post-resize, pre-normalize)
+  # Set to directory containing frame_*.pt files to skip mp4 decode
+  # Enable with: video_frame_cache_dir: ./data/video_frames_cache/libero
+  # video_frame_cache_dir: null
+  video_frame_cache_dir: ./data/video_frames_cache/libero_flux2_mmap
