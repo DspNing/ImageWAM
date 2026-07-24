@@ -159,6 +159,8 @@ class ActionDiTFlux2(nn.Module):
         mlp_ratio: float = 4.0,
         max_action_horizon: int = 64,
         use_gradient_checkpointing: bool = False,
+        use_proprio_modulation: bool = False,
+        proprio_dim: int | None = None,
     ) -> None:
         super().__init__()
         ensure_flux2_importable()
@@ -174,8 +176,27 @@ class ActionDiTFlux2(nn.Module):
         self.single_layers = int(num_layers_single)
         self.max_action_horizon = int(max_action_horizon)
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
+        self.use_proprio_modulation = bool(use_proprio_modulation)
+        self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
+        if self.use_proprio_modulation and self.proprio_dim is None:
+            raise ValueError("proprio_dim is required when use_proprio_modulation=True")
 
         self.action_encoder = nn.Linear(self.action_dim, self.hidden_dim)
+        if self.use_proprio_modulation:
+            self.proprio_encoder = nn.Sequential(
+                nn.LayerNorm(self.proprio_dim),
+                nn.Linear(self.proprio_dim, self.hidden_dim),
+                nn.SiLU(),
+            )
+            self.proprio_condition_fusion = nn.Sequential(
+                nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            # Begin as the original timestep-only conditioning and learn a
+            # proprio-dependent residual during fine-tuning.
+            nn.init.zeros_(self.proprio_condition_fusion[-1].weight)
+            nn.init.zeros_(self.proprio_condition_fusion[-1].bias)
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_dim, disable_bias=True)
         self.double_stream_modulation_img = Modulation(self.hidden_dim, double=True, disable_bias=True)
         self.single_stream_modulation = Modulation(self.hidden_dim, double=False, disable_bias=True)
@@ -252,6 +273,7 @@ class ActionDiTFlux2(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
+        proprio: torch.Tensor | None = None,
     ) -> Dict[str, Any]:
         del context, context_mask
         if action_tokens.ndim != 3:
@@ -271,7 +293,22 @@ class ActionDiTFlux2(nn.Module):
         from flux2.model import timestep_embedding
 
         tokens = self.action_encoder(action_tokens)
-        vec = self.time_in(timestep_embedding(timestep, 256)).to(dtype=tokens.dtype)
+        time_vec = self.time_in(timestep_embedding(timestep, 256)).to(dtype=tokens.dtype)
+        vec = time_vec
+        if self.use_proprio_modulation:
+            if proprio is None:
+                raise ValueError("`proprio` is required when use_proprio_modulation=True")
+            if proprio.ndim != 2 or proprio.shape != (batch_size, self.proprio_dim):
+                raise ValueError(
+                    "`proprio` must be [B, proprio_dim], got "
+                    f"{tuple(proprio.shape)}; expected ({batch_size}, {self.proprio_dim})"
+                )
+            proprio_vec = self.proprio_encoder(
+                proprio.to(device=tokens.device, dtype=tokens.dtype)
+            )
+            vec = time_vec + self.proprio_condition_fusion(
+                torch.cat([time_vec, proprio_vec], dim=-1)
+            )
         double_mod_img = self.double_stream_modulation_img(vec)
         single_mod, _ = self.single_stream_modulation(vec)
         ids = self.build_action_ids(batch_size, seq_len, device=tokens.device, dtype=tokens.dtype)

@@ -3,7 +3,7 @@ _target_: imagewam.runtime.create_imagewam_flux2_klein
 flux2_src_path: /apdcephfs_nj7/share_305204761/alixzhang/flux2
 flux2_model_path: ???
 ae_model_path: ???
-variant: klein-base-4b
+variant: klein-base-2b
 qwen3_model_spec: Qwen/Qwen3-4B
 qwen_context_len: 512
 load_text_encoder: false
@@ -12,6 +12,8 @@ mot_checkpoint_mixed_attn: true
 mot_gqa_implementation: repeat
 mot_force_flash_attention: false
 pack_proprio_after_text: true
+# Encode each horizontally concatenated camera independently before FLUX.2
+# token fusion. Keep false for the original checkpoint-compatible path.
 flux2_multicam_late_fusion: false
 flux2_num_cameras: 2
 use_proprio_modulation: false
@@ -39,8 +41,8 @@ action_dit_config:
   hidden_dim: 1024
   num_heads: 24
   attn_head_dim: 128
-  num_layers_double: 5
-  num_layers_single: 20
+  num_layers_double: 3
+  num_layers_single: 10
   mlp_ratio: 4.0
   max_action_horizon: 64
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}

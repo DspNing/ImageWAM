@@ -14,22 +14,22 @@
 
 # ==================== 参数块（按需修改）====================
 MODE="plus"                                       # "plus" | "master"
-GPUS="2,3"                                    # 用哪些卡，逗号分隔
+GPUS="6,7"                                    # 用哪些卡，逗号分隔
 
 #   plus : 传入任务清单文件路径（或由调度脚本自动生成）
 #   master: 传入任务清单文件路径
 TASK_LIST="./task_lists/libero_plus_all.txt"                                      # 留空 = 自动生成任务列表
 
 # checkpoint 路径（必填）：
-CKPT="./checkpoints/imagewam_release/libero/flux2_klein_4b/model.pt"
-# CKPT="./runs/libero_flux2_klein_4b_base_imagewam/2026-07-11_10-58-45/checkpoints/weights/step_060000.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
+# CKPT="./checkpoints/imagewam_release/libero/flux2_klein_4b/model.pt"
+CKPT="./runs/libero_flux2_klein_2b_imagewam/2026-07-22_22-05-41/checkpoints/weights/step_020000.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
 
 # dataset_stats 路径（留空 = 自动从 ckpt 父目录查找）：
 STATS="./data/dataset_stats.json"
 
 # —— 以下一般不用改 ——
-CONFIG="libero_flux2_klein_4b_base_imagewam"      # configs/task/ 下的配置名（不带 .yaml）
-MAX_TASKS_PER_GPU=4                               # 每卡并发任务数
+CONFIG="libero_flux2_klein_2b_imagewam"      # configs/task/ 下的配置名（不带 .yaml）
+MAX_TASKS_PER_GPU=12                               # 每卡并发任务数
 NUM_TRIALS=""                                      # 留空：plus→1 / master→25；填数字则强制覆盖
 
 # 用哪个 conda env 跑 worker。
@@ -39,7 +39,7 @@ WORKERS_PER_GPU=""                                 # 留空：默认 = MAX_TASKS
 TEXT_CACHE_DIR=""                                  # 留空 = 不启用文本缓存
 
 # —— 视频控制 ——
-SAVE_VIDEO="true"                                 # 是否保存 rollout 视频
+SAVE_VIDEO="false"                                 # 是否保存 rollout 视频
 MAX_VIDEOS_PER_WORKER="5"                         # plus 模式：每个 worker 最多保存多少个 task 的视频
 # ==========================================================
 
@@ -209,3 +209,5 @@ if [[ "${MODE}" == "plus" ]]; then
 else
     bash experiments/libero/run_libero_parallel_test.sh "${TASK_LIST}"
 fi
+
+# tmux kill-window -t libero_plus_batch 

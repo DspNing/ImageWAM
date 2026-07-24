@@ -43,10 +43,12 @@ class Flux2VideoExpert(nn.Module):
         torch_dtype: torch.dtype = torch.bfloat16,
     ) -> "Flux2VideoExpert":
         ensure_flux2_importable(flux2_src_path)
-        from flux2.model import Flux2, Klein4BParams, Klein9BParams
+        from flux2.model import Flux2, Klein2BParams, Klein4BParams, Klein9BParams
 
         key = str(variant).lower().replace("_", "-")
-        if key in {"klein-base-4b", "flux.2-klein-base-4b", "4b", "base-4b"}:
+        if key in {"klein-base-2b", "flux.2-klein-base-2b", "2b", "base-2b"}:
+            params = Klein2BParams()
+        elif key in {"klein-base-4b", "flux.2-klein-base-4b", "4b", "base-4b"}:
             params = Klein4BParams()
         elif key in {"klein-base-9b", "flux.2-klein-base-9b", "9b", "base-9b"}:
             params = Klein9BParams()
@@ -92,6 +94,47 @@ class Flux2VideoExpert(nn.Module):
         if latents.ndim != 4:
             raise ValueError(f"`latents` must be [B,C,H,W], got {tuple(latents.shape)}")
         return rearrange(latents, "b c h w -> b (h w) c")
+
+    @staticmethod
+    def build_multicam_img_ids(
+        batch_size: int,
+        num_cameras: int,
+        token_height: int,
+        token_width: int,
+        *,
+        time_value: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build separated 2-D RoPE grids for camera-major token groups."""
+        ids = []
+        for camera_idx in range(num_cameras):
+            camera_ids = torch.zeros(
+                token_height,
+                token_width,
+                4,
+                device=device,
+                dtype=dtype,
+            )
+            camera_ids[..., 0] = float(time_value)
+            row_offset = camera_idx * token_height
+            col_offset = camera_idx * token_width
+            camera_ids[..., 1] = torch.arange(
+                row_offset,
+                row_offset + token_height,
+                device=device,
+                dtype=dtype,
+            )[:, None]
+            camera_ids[..., 2] = torch.arange(
+                col_offset,
+                col_offset + token_width,
+                device=device,
+                dtype=dtype,
+            )[None, :]
+            # Keep the fourth axis at the original single-image value. Camera
+            # identity is represented only by the requested 2-D coordinate offset.
+            ids.append(camera_ids.reshape(1, token_height * token_width, 4).expand(batch_size, -1, -1))
+        return torch.cat(ids, dim=1)
 
     @staticmethod
     def unpack_latents(tokens: torch.Tensor, latent_height: int, latent_width: int) -> torch.Tensor:

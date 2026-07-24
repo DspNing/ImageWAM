@@ -8,7 +8,7 @@ imagewam_init "${SCRIPT_DIR}/../.."
 
 GPU_PER_NODE="${GPU_PER_NODE:-8}"
 TASK_TYPE="${TASK_TYPE:-robotwin}"        # libero | robotwin
-FLUX2_VARIANT="${FLUX2_VARIANT:-4b}"      # 4b | 9b
+FLUX2_VARIANT="${FLUX2_VARIANT:-4b}"      # 2b | 4b | 9b
 ZERO_STAGE="${ZERO_STAGE:-1}"             # 1 | zero1 | 2 | zero2
 PRECOMPUTE_QWEN3_CACHE="${PRECOMPUTE_QWEN3_CACHE:-false}"
 USE_CLEAN_ROBOTWIN="${USE_CLEAN_ROBOTWIN:-false}"
@@ -19,6 +19,12 @@ imagewam_require_env FLUX2_SRC
 imagewam_require_env FLUX2_AE_MODEL_PATH
 
 case "${FLUX2_VARIANT}" in
+  2b)
+    MODEL_CONFIG="configs/model/imagewam_flux2_klein_2b.yaml"
+    TASK_SUFFIX="flux2_klein_2b_imagewam"
+    FLUX2_QWEN3_MODEL_SPEC="${FLUX2_QWEN3_MODEL_SPEC:-Qwen/Qwen3-4B}"
+    FLUX2_MODEL_PATH="${FLUX2_MODEL_PATH:-${MODEL_ROOT}/flux2/FLUX.2-klein-base-2B/flux-2-klein-base-2b.safetensors}"
+    ;;
   4b)
     MODEL_CONFIG="configs/model/imagewam_flux2_klein_4b_base.yaml"
     TASK_SUFFIX="flux2_klein_4b_base_imagewam"
@@ -35,11 +41,17 @@ case "${FLUX2_VARIANT}" in
 esac
 export FLUX2_MODEL_PATH FLUX2_QWEN3_MODEL_SPEC ZERO_STAGE
 
+# 2B uses the same Qwen3-4B text encoder/output shape as 4B, so reuse 4B caches.
+QWEN_CACHE_VARIANT="${FLUX2_VARIANT}"
+if [ "${FLUX2_VARIANT}" = "2b" ]; then
+  QWEN_CACHE_VARIANT="4b"
+fi
+
 case "${TASK_TYPE}" in
   libero)
     ACTION_DIM=7
     TASK_NAME="libero_${TASK_SUFFIX}"
-    QWEN_CACHE_DIR="${QWEN_CACHE_DIR:-${DATA_ROOT}/flux2_qwen3_cache_${FLUX2_VARIANT}}"
+    QWEN_CACHE_DIR="${QWEN_CACHE_DIR:-${DATA_ROOT}/flux2_qwen3_cache_${QWEN_CACHE_VARIANT}}"
     DATASET_OVERRIDES=(
       "data.train.dataset_dirs=[${DATA_ROOT}/libero_spatial_no_noops_lerobot,${DATA_ROOT}/libero_object_no_noops_lerobot,${DATA_ROOT}/libero_goal_no_noops_lerobot,${DATA_ROOT}/libero_10_no_noops_lerobot]"
       "data.train.qwen_text_cache_dir=${QWEN_CACHE_DIR}"
@@ -57,7 +69,7 @@ case "${TASK_TYPE}" in
       exit 1
     fi
     ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-${DATA_ROOT}/robotwin2.0}"
-    QWEN_CACHE_DIR="${QWEN_CACHE_DIR:-${ROBOTWIN_ROOT}/flux2_qwen3_cache_${FLUX2_VARIANT}}"
+    QWEN_CACHE_DIR="${QWEN_CACHE_DIR:-${ROBOTWIN_ROOT}/flux2_qwen3_cache_${QWEN_CACHE_VARIANT}}"
     NONIDLE_FILTER_PATH="${NONIDLE_FILTER_PATH:-${ROBOTWIN_ROOT}/nonidle_ranges.json}"
     DATASET_OVERRIDES=(
       "data.train.dataset_dirs=[${ROBOTWIN_ROOT}]"

@@ -1,5 +1,7 @@
+import json
 import os
 import time
+from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -45,6 +47,7 @@ class ImageWAM(torch.nn.Module):
         omnigen2_online_text_cache_compatible: bool = False,
         qwen_context_len: int = 128,
         pack_proprio_after_text: bool = False,
+        use_proprio_modulation: bool = False,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -62,7 +65,8 @@ class ImageWAM(torch.nn.Module):
             text_dim = int(self.text_encoder.dim)
         self.text_dim = int(text_dim)
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
-        if self.proprio_dim is not None:
+        self.use_proprio_modulation = bool(use_proprio_modulation)
+        if self.proprio_dim is not None and not self.use_proprio_modulation:
             self.proprio_encoder = nn.Linear(self.proprio_dim, self.text_dim).to(torch_dtype)
         else:
             self.proprio_encoder = None
@@ -442,6 +446,9 @@ class ImageWAM(torch.nn.Module):
         flux2_lora_config: Optional[dict[str, Any]] = None,
         qwen3_model_spec: str | None = None,
         qwen_context_len: int = 512,
+        flux2_multicam_late_fusion: bool = False,
+        flux2_num_cameras: int = 2,
+        use_proprio_modulation: bool = False,
     ):
         from safetensors.torch import load_file as load_sft
 
@@ -454,7 +461,10 @@ class ImageWAM(torch.nn.Module):
         from flux2.autoencoder import AutoEncoder, AutoEncoderParams
 
         key = str(variant).lower().replace("_", "-")
-        if key in {"klein-base-4b", "flux.2-klein-base-4b", "4b", "base-4b"}:
+        if key in {"klein-base-2b", "flux.2-klein-base-2b", "2b", "base-2b"}:
+            text_dim = 7680
+            default_qwen3_model_spec = "Qwen/Qwen3-4B"
+        elif key in {"klein-base-4b", "flux.2-klein-base-4b", "4b", "base-4b"}:
             text_dim = 7680
             default_qwen3_model_spec = "Qwen/Qwen3-4B"
         elif key in {"klein-base-9b", "flux.2-klein-base-9b", "9b", "base-9b"}:
@@ -506,6 +516,11 @@ class ImageWAM(torch.nn.Module):
             "num_layers_single": int(video_expert.single_layers),
         }
         action_cfg.setdefault("hidden_dim", 1024)
+        action_cfg["use_proprio_modulation"] = bool(use_proprio_modulation)
+        if use_proprio_modulation:
+            if proprio_dim is None:
+                raise ValueError("proprio_dim is required when use_proprio_modulation=True")
+            action_cfg["proprio_dim"] = int(proprio_dim)
         for key_name, expected_value in expected_action_shape.items():
             if key_name in action_cfg and int(action_cfg[key_name]) != int(expected_value):
                 logger.warning(
@@ -571,7 +586,12 @@ class ImageWAM(torch.nn.Module):
             stack="flux2",
             qwen_context_len=int(qwen_context_len),
             pack_proprio_after_text=bool(pack_proprio_after_text),
+            use_proprio_modulation=bool(use_proprio_modulation),
         )
+        model.flux2_multicam_late_fusion = bool(flux2_multicam_late_fusion)
+        model.flux2_num_cameras = int(flux2_num_cameras)
+        if model.flux2_num_cameras < 2:
+            raise ValueError("flux2_num_cameras must be at least 2 for late fusion")
         model.model_paths = {
             "flux2": flux2_model_path,
             "flux2_src": flux2_src_path,
@@ -724,7 +744,8 @@ class ImageWAM(torch.nn.Module):
                 self.text_encoder.model.to(*args, **kwargs)
         if hasattr(self, "dim_projector"):
             self.dim_projector.to(*args, **kwargs)
-        self.vae.to(*args, **kwargs)
+        if self.vae is not None:
+            self.vae.to(*args, **kwargs)
         return self
 
     @staticmethod
@@ -1711,6 +1732,62 @@ class ImageWAM(torch.nn.Module):
         return tokens, ids
 
     @torch.no_grad()
+    def _encode_flux2_multicam_image_tokens(
+        self,
+        image: torch.Tensor,
+        *,
+        time_value: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode horizontally concatenated cameras as independent token grids."""
+        from .flux2_video_expert import Flux2VideoExpert
+
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if image.ndim != 4 or image.shape[1] != 3:
+            raise ValueError(f"`image` must be [B,3,H,W], got {tuple(image.shape)}")
+        num_cameras = int(getattr(self, "flux2_num_cameras", 2))
+        if image.shape[-1] % num_cameras != 0:
+            raise ValueError(
+                f"Image width {image.shape[-1]} must be divisible by num_cameras={num_cameras}"
+            )
+        camera_width = image.shape[-1] // num_cameras
+        if camera_width % 16 != 0:
+            raise ValueError(f"Camera width must be a multiple of 16, got {camera_width}")
+
+        batch_size = int(image.shape[0])
+        camera_images = image.reshape(
+            batch_size, 3, image.shape[-2], num_cameras, camera_width
+        ).permute(0, 3, 1, 2, 4).reshape(
+            batch_size * num_cameras, 3, image.shape[-2], camera_width
+        )
+        camera_tokens, _ = self._encode_flux2_image_tokens(
+            camera_images, time_value=time_value
+        )
+        tokens_per_camera = int(camera_tokens.shape[1])
+        tokens = camera_tokens.reshape(
+            batch_size, num_cameras, tokens_per_camera, camera_tokens.shape[-1]
+        ).reshape(batch_size, num_cameras * tokens_per_camera, camera_tokens.shape[-1])
+        latent_h = int(image.shape[-2]) // 16
+        latent_w = camera_width // 16
+        ids = Flux2VideoExpert.build_multicam_img_ids(
+            batch_size=batch_size,
+            num_cameras=num_cameras,
+            token_height=int(latent_h),
+            token_width=int(latent_w),
+            time_value=float(time_value),
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        return tokens, ids
+
+    def _encode_flux2_condition_tokens(
+        self, image: torch.Tensor, *, time_value: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if bool(getattr(self, "flux2_multicam_late_fusion", False)):
+            return self._encode_flux2_multicam_image_tokens(image, time_value=time_value)
+        return self._encode_flux2_image_tokens(image, time_value=time_value)
+
+    @torch.no_grad()
     def _decode_flux2_image_tokens(self, tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
         from .flux2_video_expert import Flux2VideoExpert
 
@@ -1730,6 +1807,39 @@ class ImageWAM(torch.nn.Module):
             all_images.append(chunk_image.detach().float().clamp(-1, 1))
 
         return torch.cat(all_images, dim=0)
+
+    @torch.no_grad()
+    def _decode_flux2_multicam_image_tokens(
+        self, tokens: torch.Tensor, height: int, width: int
+    ) -> torch.Tensor:
+        """Decode camera-major token groups and restore the horizontal layout."""
+        from .flux2_video_expert import Flux2VideoExpert
+
+        num_cameras = int(getattr(self, "flux2_num_cameras", 2))
+        if width % num_cameras != 0:
+            raise ValueError(f"Image width {width} must be divisible by num_cameras={num_cameras}")
+        camera_width = width // num_cameras
+        latent_h = int(height) // 16
+        latent_w = int(camera_width) // 16
+        tokens_per_camera = latent_h * latent_w
+        expected_tokens = num_cameras * tokens_per_camera
+        if tokens.shape[1] != expected_tokens:
+            raise ValueError(
+                f"Expected {expected_tokens} camera-major tokens, got {tokens.shape[1]}"
+            )
+
+        decoded_cameras = []
+        for camera_idx in range(num_cameras):
+            start = camera_idx * tokens_per_camera
+            end = start + tokens_per_camera
+            camera_latents = Flux2VideoExpert.unpack_latents(
+                tokens[:, start:end], latent_h, latent_w
+            )
+            camera_image = self.vae.decode(
+                camera_latents.to(device=self.device, dtype=self.torch_dtype)
+            )
+            decoded_cameras.append(camera_image.detach().float().clamp(-1, 1))
+        return torch.cat(decoded_cameras, dim=-1)
 
     @torch.no_grad()
     def _encode_flux2_text(self, sample) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1888,7 +1998,7 @@ class ImageWAM(torch.nn.Module):
                 next_frame = video[:, :, -1]
             if next_frame is None:
                 raise ValueError("FLUX.2 stack sample requires `next_frame`, `target_image`, or target token fields.")
-            target_tokens, target_img_ids = self._encode_flux2_image_tokens(next_frame, time_value=0.0)
+            target_tokens, target_img_ids = self._encode_flux2_condition_tokens(next_frame, time_value=0.0)
 
         if "ref_image_latents" in sample and "ref_img_ids" in sample:
             ref_tokens = sample["ref_image_latents"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
@@ -1901,16 +2011,32 @@ class ImageWAM(torch.nn.Module):
                 current_frame = video[:, :, 0]
             if current_frame is None:
                 raise ValueError("FLUX.2 stack sample requires `current_frame`, `input_image`, or ref token fields.")
-            ref_tokens, ref_img_ids = self._encode_flux2_image_tokens(current_frame, time_value=10.0)
+            ref_tokens, ref_img_ids = self._encode_flux2_condition_tokens(current_frame, time_value=10.0)
 
         text_hidden_states, text_attention_mask = self._encode_flux2_text(sample)
-        if self.proprio_encoder is not None:
-            text_hidden_states, text_attention_mask = self._append_proprio_to_context_if_enabled(
-                context=text_hidden_states,
-                context_mask=text_attention_mask,
-                proprio=sample.get("proprio"),
-                source="FLUX.2 training sample",
-            )
+        proprio_for_action = None
+        if self.use_proprio_modulation or self.proprio_encoder is not None:
+            if self.use_proprio_modulation:
+                proprio_for_action = sample.get("proprio")
+                if proprio_for_action is None:
+                    raise ValueError("FLUX.2 proprio modulation requires `sample['proprio']`.")
+                if proprio_for_action.ndim == 3:
+                    proprio_for_action = proprio_for_action[:, 0, :]
+                if proprio_for_action.ndim != 2 or proprio_for_action.shape[1] != self.proprio_dim:
+                    raise ValueError(
+                        f"FLUX.2 proprio must be [B,{self.proprio_dim}] or [B,T,{self.proprio_dim}], "
+                        f"got {tuple(proprio_for_action.shape)}"
+                    )
+                proprio_for_action = proprio_for_action.to(
+                    device=self.device, dtype=self.torch_dtype, non_blocking=True
+                )
+            else:
+                text_hidden_states, text_attention_mask = self._append_proprio_to_context_if_enabled(
+                    context=text_hidden_states,
+                    context_mask=text_attention_mask,
+                    proprio=sample.get("proprio"),
+                    source="FLUX.2 training sample",
+                )
         action = sample["action"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         action_is_pad = sample.get("action_is_pad")
         if action_is_pad is not None:
@@ -1925,6 +2051,7 @@ class ImageWAM(torch.nn.Module):
             "ref_img_ids": ref_img_ids,
             "text_hidden_states": text_hidden_states,
             "text_attention_mask": text_attention_mask,
+            "proprio": proprio_for_action,
             "action": action,
             "action_is_pad": action_is_pad,
             "action_dim_is_pad": action_dim_is_pad,
@@ -2462,6 +2589,7 @@ class ImageWAM(torch.nn.Module):
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
             timestep=self._scheduler_timestep_to_unit(timestep_action, self.train_action_scheduler),
+            proprio=inputs.get("proprio"),
         )
         attention_mask = self._build_mot_attention_mask_flux2(
             batch_size=batch_size,
@@ -3557,7 +3685,21 @@ class ImageWAM(torch.nn.Module):
             raise ValueError(f"`input_image` must be [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}")
 
         text_hidden, text_mask = self._prepare_flux2_infer_text(prompt, context, context_mask)
-        if self.proprio_encoder is not None or proprio is not None:
+        proprio_for_action = None
+        if self.use_proprio_modulation:
+            if proprio is None:
+                raise ValueError("FLUX.2 action inference with proprio modulation requires `proprio`.")
+            proprio_for_action = proprio
+            if proprio_for_action.ndim == 3:
+                proprio_for_action = proprio_for_action[:, 0, :]
+            elif proprio_for_action.ndim == 1:
+                proprio_for_action = proprio_for_action.unsqueeze(0)
+            if proprio_for_action.ndim != 2 or proprio_for_action.shape[1] != self.proprio_dim:
+                raise ValueError(
+                    f"FLUX.2 proprio must be [B,{self.proprio_dim}], got {tuple(proprio_for_action.shape)}"
+                )
+            proprio_for_action = proprio_for_action.to(device=self.device, dtype=self.torch_dtype)
+        elif self.proprio_encoder is not None or proprio is not None:
             text_hidden, text_mask = self._append_proprio_to_context_if_enabled(
                 context=text_hidden,
                 context_mask=text_mask,
@@ -3565,7 +3707,7 @@ class ImageWAM(torch.nn.Module):
                 source="FLUX.2 action inference",
             )
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        ref_tokens, ref_img_ids = self._encode_flux2_image_tokens(input_image, time_value=10.0)
+        ref_tokens, ref_img_ids = self._encode_flux2_condition_tokens(input_image, time_value=10.0)
         batch_size = int(ref_tokens.shape[0])
         empty_target = ref_tokens.new_zeros(batch_size, 0, ref_tokens.shape[-1])
         empty_target_ids = ref_img_ids.new_zeros(batch_size, 0, ref_img_ids.shape[-1])
@@ -3639,6 +3781,7 @@ class ImageWAM(torch.nn.Module):
             action_pre = self.action_expert.pre_dit(
                 action_tokens=latents_action,
                 timestep=self._scheduler_timestep_to_unit(timestep_action, self.infer_action_scheduler),
+                proprio=proprio_for_action,
             )
             action_tokens = self.mot.forward_action_with_video_cache(
                 action_tokens=action_pre["tokens"],
@@ -3747,7 +3890,7 @@ class ImageWAM(torch.nn.Module):
                 source="FLUX.2 video inference",
             )
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        ref_tokens, ref_img_ids = self._encode_flux2_image_tokens(input_image, time_value=10.0)
+        ref_tokens, ref_img_ids = self._encode_flux2_condition_tokens(input_image, time_value=10.0)
         batch_size = int(ref_tokens.shape[0])
         latent_h = int(height) // 16
         latent_w = int(width) // 16
@@ -3759,14 +3902,25 @@ class ImageWAM(torch.nn.Module):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
-        target_img_ids = Flux2VideoExpert.build_img_ids(
-            batch_size=batch_size,
-            token_height=latent_h,
-            token_width=latent_w,
-            time_value=0.0,
-            device=self.device,
-            dtype=self.torch_dtype,
-        )
+        if bool(getattr(self, "flux2_multicam_late_fusion", False)):
+            target_img_ids = Flux2VideoExpert.build_multicam_img_ids(
+                batch_size=batch_size,
+                num_cameras=int(getattr(self, "flux2_num_cameras", 2)),
+                token_height=latent_h,
+                token_width=latent_w // int(getattr(self, "flux2_num_cameras", 2)),
+                time_value=0.0,
+                device=self.device,
+                dtype=self.torch_dtype,
+            )
+        else:
+            target_img_ids = Flux2VideoExpert.build_img_ids(
+                batch_size=batch_size,
+                token_height=latent_h,
+                token_width=latent_w,
+                time_value=0.0,
+                device=self.device,
+                dtype=self.torch_dtype,
+            )
 
         infer_timesteps, infer_deltas = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -3798,7 +3952,12 @@ class ImageWAM(torch.nn.Module):
             pred_video = self.video_expert.post_dit(tokens_out, video_pre)
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta, latents_video)
 
-        image = self._decode_flux2_image_tokens(latents_video, height=height, width=width)
+        if bool(getattr(self, "flux2_multicam_late_fusion", False)):
+            image = self._decode_flux2_multicam_image_tokens(
+                latents_video, height=height, width=width
+            )
+        else:
+            image = self._decode_flux2_image_tokens(latents_video, height=height, width=width)
         return {"image": image[0].detach().cpu()}
 
     @torch.no_grad()

@@ -5,20 +5,37 @@
 set -euo pipefail
 
 # Set GPU
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
 # Project paths
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+VARIANT=2b # Options: 2b, 4b, 9b
+
+# "camera": "Camera Viewpoints",
+# "robot": "Robot Initial States",
+# "language": "Language Instructions",
+# "light": "Light Conditions",
+# "background": "Background Textures",
+# "noise": "Sensor Noise",
+# "layout": "Objects Layout",
+
+# Category filtering
+CATEGORY="robot"
+TASK_SUITE_NAME="libero_goal"
+TASK_ID=""
+
 # Default paths (can be overridden by environment variables)
 FLUX2_SRC="${FLUX2_SRC:-${REPO_ROOT}/third_party/flux2}"
-FLUX2_MODEL_PATH="${FLUX2_MODEL_PATH:-${REPO_ROOT}/checkpoints/flux2/FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors}"
+FLUX2_MODEL_PATH="${FLUX2_MODEL_PATH:-${REPO_ROOT}/checkpoints/flux2/FLUX.2-klein-base-2B/flux-2-klein-base-2b.safetensors}"
 FLUX2_AE_MODEL_PATH="${FLUX2_AE_MODEL_PATH:-${REPO_ROOT}/checkpoints/flux2/FLUX.2-dev/ae.safetensors}"
 FLUX2_QWEN3_MODEL_SPEC="${FLUX2_QWEN3_MODEL_SPEC:-Qwen/Qwen3-4B}"
 
+TASK="${TASK:-libero_flux2_klein_${VARIANT}_imagewam}"
+
 # Default checkpoint (use latest if not specified)
-CKPT_PATH="./runs/libero_flux2_klein_4b_base_imagewam/2026-07-15_16-26-58/checkpoints/weights/step_062000.pt"
+CKPT_PATH="./runs/libero_flux2_klein_2b_imagewam/2026-07-20_00-30-41-base_9_epoch/checkpoints/weights/step_019530.pt"
 DATASET_STATS_PATH="./data/dataset_stats.json"
 
 # Check if files exist
@@ -35,16 +52,13 @@ if [ ! -f "${DATASET_STATS_PATH}" ]; then
 fi
 
 # Other defaults
-TASK="${TASK:-libero_flux2_klein_4b_base_imagewam}"
+
 OUTPUT_DIR="${OUTPUT_DIR:-./evaluate_results/libero_video_rollout/$(date +%Y%m%d_%H%M%S)}"
-NUM_TRIALS="${NUM_TRIALS:-3}"
+NUM_TRIALS="${NUM_TRIALS:-1}"
 ACTION_HORIZON="${ACTION_HORIZON:-16}"
 REPLAN_STEPS="${REPLAN_STEPS:-12}"
 NUM_STEPS_WAIT="${NUM_STEPS_WAIT:-30}"
 GPU_ID="${GPU_ID:-0}"
-
-# Category filtering
-CATEGORY="${CATEGORY:-}"
 
 # Python setup
 export PYTHONPATH="${REPO_ROOT}/src:${FLUX2_SRC}/src:${FLUX2_SRC}:${PYTHONPATH:-}"
@@ -74,7 +88,7 @@ CMD=(
     model.flux2_src_path="${FLUX2_SRC}"
     model.flux2_model_path="${FLUX2_MODEL_PATH}"
     model.ae_model_path="${FLUX2_AE_MODEL_PATH}"
-    model.variant="klein-base-4b"
+    model.variant="klein-base-${VARIANT}"
     model.qwen3_model_spec="${FLUX2_QWEN3_MODEL_SPEC}"
     model.load_text_encoder=true
     model.pack_proprio_after_text=true

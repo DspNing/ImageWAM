@@ -325,6 +325,9 @@ def create_imagewam_flux2_klein(
     mot_force_flash_attention: bool = False,
     pack_proprio_after_text: bool = True,
     flux2_lora_config=None,
+    flux2_multicam_late_fusion: bool = False,
+    flux2_num_cameras: int = 2,
+    use_proprio_modulation: bool = False,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -389,6 +392,9 @@ def create_imagewam_flux2_klein(
         mot_force_flash_attention=bool(mot_force_flash_attention),
         pack_proprio_after_text=bool(pack_proprio_after_text),
         flux2_lora_config=flux2_lora_config,
+        flux2_multicam_late_fusion=bool(flux2_multicam_late_fusion),
+        flux2_num_cameras=int(flux2_num_cameras),
+        use_proprio_modulation=bool(use_proprio_modulation),
     )
 
 

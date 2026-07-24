@@ -12,6 +12,9 @@ mot_checkpoint_mixed_attn: true
 mot_gqa_implementation: repeat
 mot_force_flash_attention: false
 pack_proprio_after_text: true
+flux2_multicam_late_fusion: false
+flux2_num_cameras: 2
+use_proprio_modulation: false
 action_dit_pretrained_path: null
 
 flux2_lora_config:

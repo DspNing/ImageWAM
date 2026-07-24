@@ -5,7 +5,8 @@ extracted_episodes/*
 
 outputs/
 checkpoints
-data*
+data/
+data_aug_visualize/
 apex/
 assets/
 runs
@@ -275,6 +276,9 @@ attention_viz_collected/
 attention_viz_robotwin_smoke/
 third_party/LIBERO-master
 third_party/LIBERO-plus
+third_party/ChordEdit
+third_party/minit2i-torch
+third_party/Mage
 third_party/flux2
 third_party/OmniGen2
 third_party/RoboTwin/assets/*
@@ -286,3 +290,6 @@ docs/model_card_*.md
 docs/huggingface_model_card_template.md
 
 task_lists/
+docs/
+tests/
+projects/

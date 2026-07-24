@@ -2,7 +2,7 @@
 
 defaults:
   - override /data: libero_omnigen2_pair
-  - override /model: imagewam_flux2_klein_9b_base
+  - override /model: imagewam_flux2_klein_2b
   - _self_
 
 data:
@@ -12,21 +12,19 @@ data:
     qwen_context_len: 512
     qwen_text_cache_format: qwen3_flux2
 
-batch_size: 4
+batch_size: 10
 num_workers: 24
-prefetch_factor: 2
+prefetch_factor: 4
 persistent_workers: true
-
 learning_rate: 1e-4
 num_epochs: 10
 max_steps: null
 log_every: 10
-save_every: 1000
-eval_every: 100
+save_every: 2000
+eval_every: 500
 eval_num_samples: 2
 keep_latest_state_only: true
-
-gradient_accumulation_steps: 3
+gradient_accumulation_steps: 1
 weight_decay: 1.0e-2
 mixed_precision: "bf16"
 resume: null
@@ -37,4 +35,4 @@ model:
 wandb:
   enabled: true
   project: imagewam
-  name: libero_flux2_klein_9b_base_imagewam
+  name: libero_flux2_klein_2b_imagewam
