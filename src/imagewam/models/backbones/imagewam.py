@@ -1169,7 +1169,7 @@ class ImageWAM(torch.nn.Module):
                     "`sample['image_is_pad']` shape mismatch: "
                     f"got {tuple(image_is_pad.shape)} vs expected ({batch_size}, {num_frames})"
                 )
-        
+
         input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
@@ -1453,14 +1453,22 @@ class ImageWAM(torch.nn.Module):
         ta = self.train_action_scheduler.sample_training_t(b, self.device, action.dtype)
         nv, na = torch.randn_like(target), torch.randn_like(action)
         noisy_target = self.train_video_scheduler.add_noise(target, nv, tv)
+        target_video = self.train_video_scheduler.training_target(target, nv, tv).float()
         noisy_action = self.train_action_scheduler.add_noise(action, na, ta)
+        target_action = self.train_action_scheduler.training_target(action, na, ta)
+
         video_pre = self.video_expert.pre_dit(
-            noisy_target.flatten(2).transpose(1, 2), tv, inputs["text_hidden_states"],
+            noisy_target.flatten(2).transpose(1, 2),
+            self._scheduler_timestep_to_unit(tv, self.train_video_scheduler),
+            inputs["text_hidden_states"],
             inputs["text_attention_mask"], inputs["ref_image_latents"].flatten(2).transpose(1, 2),
             img_shapes=[[(1, int(target.shape[-2]), int(target.shape[-1]))]
                         * (2 * int(target.shape[0]))])
-        action_pre = self.action_expert.pre_dit(noisy_action, ta)
-        txt_len = int(video_pre["packed_context"].shape[1])
+        action_pre = self.action_expert.pre_dit(
+            noisy_action,
+            self._scheduler_timestep_to_unit(ta, self.train_action_scheduler),
+        )
+
         ref_len = self._mage_image_token_length(inputs["ref_image_latents"])
         target_len = self._mage_image_token_length(target)
         mot_attention_mask = self._build_mot_attention_mask_mage_flow_packed(
@@ -1483,17 +1491,22 @@ class ImageWAM(torch.nn.Module):
         pred_video = self.video_expert.post_dit(out["video"], video_pre)
         pred_action = self.action_expert.post_dit(out["action"], action_pre)
         pred_video = pred_video.transpose(1, 2).reshape_as(target)
-        lv = F.mse_loss(
-            pred_video.float(),
-            self.train_video_scheduler.training_target(target, nv, tv).float(),
+        video_loss_per_sample = F.mse_loss(pred_video.float(), target_video.float(), reduction="none").flatten(1).mean(dim=1)
+        video_weight = self.train_video_scheduler.training_weight(tv).to(
+            video_loss_per_sample.device, dtype=video_loss_per_sample.dtype
         )
-        la_per_sample = self._compute_action_loss_per_sample(
+        lv = (video_loss_per_sample * video_weight).mean()
+
+        action_loss_per_sample = self._compute_action_loss_per_sample(
             pred_action,
-            self.train_action_scheduler.training_target(action, na, ta),
+            target_action,
             action_is_pad=inputs.get("action_is_pad"),
             action_dim_is_pad=inputs.get("action_dim_is_pad"),
         )
-        la = la_per_sample.mean()
+        action_weight = self.train_action_scheduler.training_weight(ta).to(
+            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        )
+        la = (action_loss_per_sample * action_weight).mean()
         return self.loss_lambda_video * lv + self.loss_lambda_action * la, {
             "loss_video": float(lv.detach()), "loss_action": float(la.detach())
         }
@@ -3170,14 +3183,21 @@ class ImageWAM(torch.nn.Module):
                               context, context_mask):
         video_pre = self.video_expert.pre_dit(
             x=target.flatten(2).transpose(1, 2),
-            timestep=timestep_video,
+            timestep=self._scheduler_timestep_to_unit(
+                timestep_video, self.infer_video_scheduler
+            ),
             context=context,
             context_mask=context_mask,
             ref_image_hidden_states=reference.flatten(2).transpose(1, 2),
             img_shapes=[[(1, int(target.shape[-2]), int(target.shape[-1]))]
                         * (2 * int(target.shape[0]))],
         )
-        action_pre = self.action_expert.pre_dit(action, timestep_action)
+        action_pre = self.action_expert.pre_dit(
+            action,
+            self._scheduler_timestep_to_unit(
+                timestep_action, self.infer_action_scheduler
+            ),
+        )
         mask = self._build_mot_attention_mask_mage_flow_packed(
             text_cu_lens=video_pre["txt_cu_lens"],
             image_cu_lens=video_pre["img_cu_lens"],

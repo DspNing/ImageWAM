@@ -151,7 +151,15 @@ class MageFlowActionDiT(nn.Module):
         if pretrained_path:
             payload = torch.load(pretrained_path, map_location="cpu")
             state = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
-            model.load_state_dict(state, strict=False)
+            load_result = model.load_state_dict(state, strict=False)
+            if load_result.missing_keys or load_result.unexpected_keys:
+                print(
+                    "[MageFlowActionDiT] checkpoint loaded with key mismatches: "
+                    f"missing_keys={load_result.missing_keys}, "
+                    f"unexpected_keys={load_result.unexpected_keys}, "
+                    f"checkpoint={pretrained_path}",
+                    flush=True,
+                )
         return model
 
     @staticmethod
@@ -209,6 +217,11 @@ class MageFlowActionDiT(nn.Module):
     def pre_dit(self, action_tokens: torch.Tensor, timestep: torch.Tensor, **_: Any):
         if action_tokens.ndim != 3 or action_tokens.shape[-1] != self.action_dim:
             raise ValueError(f"Expected action tokens [B,T,{self.action_dim}]")
+        if action_tokens.shape[1] > self.max_action_horizon:
+            raise ValueError(
+                f"Action length {action_tokens.shape[1]} exceeds "
+                f"max_action_horizon={self.max_action_horizon}"
+            )
         from .mage_flow_imports import ensure_mage_flow_importable
         ensure_mage_flow_importable()
         from mage_flow.models.modules.mage_layers import get_timestep_embedding

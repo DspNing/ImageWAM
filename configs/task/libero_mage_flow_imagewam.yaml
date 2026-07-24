@@ -8,12 +8,14 @@ defaults:
 data:
   train:
     mage_text_cache_dir: ${oc.env:MAGE_TEXT_CACHE_DIR,./data/mage_text_cache/libero/}
+    mage_context_len: 120
     require_text_cache: false
     qwen_text_cache_dir: null
     qwen_text_cache_format: qwen3_flux2
   
   eval:
     mage_text_cache_dir: ${oc.env:MAGE_TEXT_CACHE_DIR,./data/mage_text_cache/libero/}
+    mage_context_len: 120
     require_text_cache: false
     qwen_text_cache_dir: null
     qwen_text_cache_format: qwen3_flux2
@@ -27,7 +29,7 @@ learning_rate: 1e-4
 num_epochs: 10
 mixed_precision: "bf16"
 save_every: 2000
-eval_every: 100
+eval_every: 500
 eval_num_samples: 2
 
 wandb:

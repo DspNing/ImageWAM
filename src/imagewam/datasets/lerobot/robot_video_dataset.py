@@ -56,6 +56,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         qwen_context_len: int = 128,
         qwen_text_cache_format: str = "qwen2_5_vl",
         mage_text_cache_dir: Optional[str] = None,
+        mage_context_len: int = 2048,
         endpoint_frames_only: bool = False,
         nonidle_filter_path: Optional[str] = None,
         profile_getitem: bool = False,
@@ -128,6 +129,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.require_text_cache = bool(require_text_cache)
         self.qwen_text_cache_dir = qwen_text_cache_dir
         self.mage_text_cache_dir = mage_text_cache_dir
+        self.mage_context_len = int(mage_context_len)
         self.qwen_context_len = int(qwen_context_len)
         self.qwen_text_cache_format = str(qwen_text_cache_format)
         self.endpoint_frames_only = bool(endpoint_frames_only)
@@ -876,10 +878,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             # collator can allocate writable batch storage.
             hidden_states = payload["context"].clone()
             attention_mask = payload["context_mask"].bool().clone()
-            target_len = self.context_len
+            target_len = self.mage_context_len
             if hidden_states.shape[0] > target_len:
-                hidden_states = hidden_states[:target_len]
-                attention_mask = attention_mask[:target_len]
+                raise ValueError(
+                    "Mage text cache is longer than the configured mage_context_len; refusing to truncate "
+                    f"real tokens: cache_len={hidden_states.shape[0]}, mage_context_len={target_len}, "
+                    f"cache_path={cache_path}"
+                )
             elif hidden_states.shape[0] < target_len:
                 pad_len = target_len - hidden_states.shape[0]
                 hidden_states = torch.cat([

@@ -85,16 +85,15 @@ class MageFlowVideoExpert(nn.Module):
         from mage_flow.pipeline import load_from_repo
 
         if text_encoder_only:
-            model = load_from_repo(model_path, device="cpu")
+            model = load_from_repo(model_path, device="cpu", load_text_encoder=True)
             model.transformer = None
             model.vae = None
             model.txt_enc.to(device=device, dtype=torch_dtype).eval()
         elif load_text_encoder:
-            model = load_from_repo(model_path, device="cpu")
+            model = load_from_repo(model_path, device="cpu", load_text_encoder=True)
             model.to(device=device, dtype=torch_dtype).eval()
         else:
-            model = load_from_repo(model_path, device="cpu")
-            model.txt_enc = None
+            model = load_from_repo(model_path, device="cpu", load_text_encoder=False)
             model.transformer.to(device=device, dtype=torch_dtype)
             if model.vae is not None:
                 model.vae.to(device=device, dtype=torch_dtype)

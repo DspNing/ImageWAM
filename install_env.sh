@@ -1,4 +1,4 @@
-pip install transformers==4.56.1
+pip install transformers==5.5.0
 
 pip install \
   accelerate==1.12.0 av==16.0.1 boto3==1.35.99 datasets==3.6.0 \
