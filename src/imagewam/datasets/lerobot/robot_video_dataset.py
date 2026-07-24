@@ -55,6 +55,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         qwen_text_cache_dir: Optional[str] = None,
         qwen_context_len: int = 128,
         qwen_text_cache_format: str = "qwen2_5_vl",
+        mage_text_cache_dir: Optional[str] = None,
         endpoint_frames_only: bool = False,
         nonidle_filter_path: Optional[str] = None,
         profile_getitem: bool = False,
@@ -126,6 +127,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.is_training_set = is_training_set
         self.require_text_cache = bool(require_text_cache)
         self.qwen_text_cache_dir = qwen_text_cache_dir
+        self.mage_text_cache_dir = mage_text_cache_dir
         self.qwen_context_len = int(qwen_context_len)
         self.qwen_text_cache_format = str(qwen_text_cache_format)
         self.endpoint_frames_only = bool(endpoint_frames_only)
@@ -249,6 +251,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.lerobot_dataset)
 
+    def _mage_cache_key(self, instruction: str, reference: torch.Tensor) -> str:
+        # Match precompute_text_cache.py.  The precompute dataset disables
+        # augmentation, so hash the cropped/normalized pre-augmentation frame.
+        reference = self.crop_transform(reference.unsqueeze(0))[0]
+        reference = (reference * 2.0 - 1.0).float().contiguous().cpu()
+        digest = hashlib.sha256(instruction.encode("utf-8"))
+        digest.update(reference.numpy().tobytes())
+        return digest.hexdigest()
+
     def _get_from_video_frame_cache(self, idx):
         """Build sample from video frame cache (uint8) + action/proprio cache.
 
@@ -309,6 +320,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             # For robotwin or other complex layouts, skip augmentation in cache mode
             video = None
         # logger.info(f"[DEBUG] Loaded video from cache: {frame_path}, shape={video.shape if video is not None else 'N/A'}")
+        mage_reference = torch.cat([video[i] for i in range(num_cameras)], dim=-1) if video is not None else None
         # Apply video augmentation if enabled and we reconstructed multi-camera format
         if video is not None and self.video_augmentation is not None:
             video = self.video_augmentation(video)  # [num_cameras, T, C, H, W] → [num_cameras, T, C, H, W]
@@ -355,6 +367,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": action_is_pad,
             "proprio_is_pad": torch.zeros_like(action_is_pad),
         }
+        data["_mage_cache_key"] = self._mage_cache_key(instruction, mage_reference[0])
 
         if self.require_text_cache:
             context, context_mask = self._get_cached_text_context(instruction)
@@ -436,6 +449,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         else:
             video = None
 
+        mage_reference = torch.cat([video[i] for i in range(num_cameras)], dim=-1) if video is not None else None
         # Apply augmentation
         if video is not None and self.video_augmentation is not None:
             video = self.video_augmentation(video)
@@ -476,6 +490,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": action_is_pad,
             "proprio_is_pad": torch.zeros_like(action_is_pad),
         }
+        data["_mage_cache_key"] = self._mage_cache_key(instruction, mage_reference[0])
 
         if self.require_text_cache:
             context, context_mask = self._get_cached_text_context(instruction)
@@ -848,6 +863,36 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             print(traceback.format_exc())
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
+            idx = random_idx
+        if self.mage_text_cache_dir is not None:
+            cache_key = data.get("_mage_cache_key")
+            if cache_key is None:
+                raise ValueError("Mage text cache key is unavailable for this dataset path")
+            cache_path = os.path.join(self.mage_text_cache_dir, f"{cache_key}.pt")
+            if not os.path.exists(cache_path):
+                raise FileNotFoundError(f"Missing Mage text cache: {cache_path}")
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            # Clone tensors loaded from cache so the default DataLoader
+            # collator can allocate writable batch storage.
+            hidden_states = payload["context"].clone()
+            attention_mask = payload["context_mask"].bool().clone()
+            target_len = self.context_len
+            if hidden_states.shape[0] > target_len:
+                hidden_states = hidden_states[:target_len]
+                attention_mask = attention_mask[:target_len]
+            elif hidden_states.shape[0] < target_len:
+                pad_len = target_len - hidden_states.shape[0]
+                hidden_states = torch.cat([
+                    hidden_states,
+                    hidden_states.new_zeros((pad_len, hidden_states.shape[1])),
+                ], dim=0)
+                attention_mask = torch.cat([
+                    attention_mask,
+                    attention_mask.new_zeros((pad_len,)),
+                ], dim=0)
+            data["mage_text_hidden_states"] = hidden_states
+            data["mage_text_attention_mask"] = attention_mask
+        data.pop("_mage_cache_key", None)
         elapsed = time.perf_counter() - t0
         if self.slow_getitem_log_sec > 0.0 and elapsed >= self.slow_getitem_log_sec:
             profile = data.get("_profile", {})

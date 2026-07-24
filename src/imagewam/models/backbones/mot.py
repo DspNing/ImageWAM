@@ -1082,11 +1082,14 @@ class MoT(nn.Module):
     def forward(
         self,
         embeds_all: Dict[str, torch.Tensor],
-        attention_mask: torch.Tensor,
-        freqs_all: Dict[str, torch.Tensor],
-        context_all: Dict[str, Optional[dict]],
-        t_mod_all: Dict[str, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        freqs_all: Dict[str, torch.Tensor] | None = None,
+        context_all: Dict[str, Optional[dict]] | None = None,
+        t_mod_all: Dict[str, torch.Tensor] | None = None,
     ):
+        if self.block_protocol == "mage_flow":
+            return self._forward_mage_flow(embeds_all, context_all or {})
+
         if self.block_protocol == "sana":
             return self._forward_sana(
                 embeds_all=embeds_all,
@@ -1156,3 +1159,69 @@ class MoT(nn.Module):
                 )
                 start = end
         return tokens_all
+
+    def _forward_mage_flow(self, embeds_all, context_all):
+        video_state = context_all.get("video") or {}
+        action_state = context_all.get("action") or {}
+        video = embeds_all["video"]
+        action = embeds_all["action"]
+        required = (
+            video_state.get("packed_context"), video_state.get("temb"),
+            video_state.get("rope"), video_state.get("img_cu_lens"),
+            video_state.get("txt_cu_lens"), action_state.get("temb"),
+            action_state.get("cu_lens"),
+        )
+        if any(value is None for value in required):
+            raise ValueError("Mage-Flow MoT requires prepared video/action pre_dit states")
+        video_expert = self.mixtures["video"]
+        action_expert = self.mixtures["action"]
+        vtr = video_expert.transformer
+        text = video_state["packed_context"]
+        vtemb, vrope = video_state["temb"], video_state["rope"]
+        vcu, tcu = video_state["img_cu_lens"], video_state["txt_cu_lens"]
+        atemb, acu = action_state["temb"], action_state["cu_lens"]
+        full_mask = context_all.get("mot_attention_mask")
+        if full_mask is None:
+            raise ValueError("Mage-Flow MoT requires a full packed mixed attention mask")
+        if full_mask.ndim == 3 and full_mask.shape[0] != 1:
+            raise ValueError(
+                "Mage-Flow packed mixed attention currently requires a single packed mask; "
+                f"got {tuple(full_mask.shape)}"
+            )
+        # The mixed sequence is packed as [text | video image | action].
+        # `video` contains image tokens only; the packed text stream is kept
+        # separately in `text` and must be included in the mask geometry.
+        total_len = int(text.shape[1] + video.shape[1] + action.shape[1])
+        if full_mask.shape[-2:] != (total_len, total_len):
+            raise ValueError(
+                "Mage-Flow packed mixed attention mask does not match joint streams: "
+                f"got {tuple(full_mask.shape)}, expected trailing shape {(total_len, total_len)}"
+            )
+
+        for vblock, ablock in zip(vtr.transformer_blocks, action_expert.blocks):
+            def layer_fn(video_in, text_in, action_in):
+                v_state = vblock.prepare_qkv(
+                    video_in, text_in, vtemb, vrope, tcu, vcu)
+                a_state = ablock.prepare_qkv(action_in, video_in, atemb, acu)
+                q = torch.cat((v_state["q"], a_state["q"]), dim=1)
+                k = torch.cat((v_state["k"], a_state["k"]), dim=1)
+                value = torch.cat((v_state["v"], a_state["v"]), dim=1)
+                mixed = self._mixed_attention(q, k, value, full_mask)
+                v_len = v_state["text_len"] + v_state["image_len"]
+                video_mixed, action_mixed = torch.split(
+                    mixed, [v_len, a_state["q"].shape[1]], dim=1)
+                text_out, video_out = vblock.apply_attention(video_mixed, v_state)
+                action_out = ablock.apply_attention(action_mixed, a_state)
+                return video_out, text_out, action_out
+            if self.mot_checkpoint_mixed_attn and self.training:
+                video, text, action = torch.utils.checkpoint.checkpoint(
+                    layer_fn, video, text, action, use_reentrant=False)
+            else:
+                video, text, action = layer_fn(video, text, action)
+
+        video = vtr.norm_out(video, vtemb, cu_seqlens=vcu)
+        video = vtr.proj_out(video).reshape(
+            int(video_state["batch_size"]), -1, vtr.out_channels)
+        action = action_expert.final_norm(action).reshape(
+            int(action_state["batch_size"]), -1, action_expert.hidden_dim)
+        return {"video": video, "action": action}

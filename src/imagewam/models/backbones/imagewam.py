@@ -585,6 +585,72 @@ class ImageWAM(torch.nn.Module):
         return model
 
     @classmethod
+    def from_mage_flow_pretrained(
+        cls,
+        mage_flow_model_path: str,
+        mage_flow_src_path: str | None,
+        action_dit_config: dict[str, Any],
+        proprio_dim: Optional[int] = None,
+        video_scheduler: dict[str, Any] | None = None,
+        action_scheduler: dict[str, Any] | None = None,
+        loss: dict[str, Any] | None = None,
+        mot_checkpoint_mixed_attn: bool = True,
+        device: str = "cuda",
+        torch_dtype: torch.dtype = torch.bfloat16,
+        load_text_encoder: bool = True,
+    ):
+        from .mage_flow_action import MageFlowActionDiT
+        from .mot import MoT
+        from .mage_flow_video_expert import MageFlowVideoExpert
+
+        video_expert = MageFlowVideoExpert.from_pretrained(
+            mage_flow_model_path, mage_flow_src_path, device=device,
+            torch_dtype=torch_dtype, load_text_encoder=load_text_encoder
+        )
+        action_cfg = dict(action_dit_config or {})
+        action_dim = int(action_cfg.pop("action_dim"))
+        action_expert = MageFlowActionDiT.from_video_transformer(
+            video_expert.transformer,
+            action_dim=action_dim,
+            action_hidden_dim=int(action_cfg.pop("hidden_dim", 1024)),
+            pretrained_path=action_cfg.pop("pretrained_path", None),
+            max_action_horizon=int(action_cfg.pop("max_action_horizon", 64)),
+            device=device,
+            torch_dtype=torch_dtype,
+        )
+        mot = MoT(
+            {"video": video_expert, "action": action_expert},
+            mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn))
+        sched_v = dict(video_scheduler or {})
+        sched_a = dict(action_scheduler or {})
+        if not {"train_shift", "infer_shift", "num_train_timesteps"} <= set(sched_a):
+            raise ValueError("Mage-Flow action_scheduler requires train_shift, infer_shift and num_train_timesteps")
+        loss_cfg = dict(loss or {})
+        model = cls(
+            video_expert=video_expert,
+            action_expert=action_expert,
+            mot=mot,
+            vae=video_expert.vae,
+            text_encoder=None,
+            tokenizer=None,
+            text_dim=int(video_expert.caption_dim),
+            proprio_dim=proprio_dim,
+            device=device,
+            torch_dtype=torch_dtype,
+            video_train_shift=float(sched_v.get("train_shift", 6.0)),
+            video_infer_shift=float(sched_v.get("infer_shift", 6.0)),
+            video_num_train_timesteps=int(sched_v.get("num_train_timesteps", 1000)),
+            action_train_shift=float(sched_a["train_shift"]),
+            action_infer_shift=float(sched_a["infer_shift"]),
+            action_num_train_timesteps=int(sched_a["num_train_timesteps"]),
+            loss_lambda_video=float(loss_cfg.get("lambda_video", 0.5)),
+            loss_lambda_action=float(loss_cfg.get("lambda_action", 1.0)),
+            stack="mage_flow",
+        )
+        model.model_paths = {"mage_flow": mage_flow_model_path, "mage_flow_src": mage_flow_src_path}
+        return model
+
+    @classmethod
     def from_dim_pretrained(
         cls,
         dim_model_path: str,
@@ -1323,6 +1389,121 @@ class ImageWAM(torch.nn.Module):
             "action_is_pad": action_is_pad,
             "action_dim_is_pad": action_dim_is_pad,
         }
+
+    def build_inputs_mage_flow(self, sample, tiled: bool = False):
+        del tiled
+        video = sample.get("video")
+        target = sample.get("next_frame", sample.get("target_image"))
+        reference = sample.get("current_frame", sample.get("input_image"))
+        if video is not None:
+            if video.ndim != 5 or video.shape[1] != 3:
+                raise ValueError("Mage-Flow sample['video'] must be [B,3,T,H,W]")
+            reference = reference if reference is not None else video[:, :, 0]
+            target = target if target is not None else video[:, :, -1]
+        if target is None or reference is None:
+            raise ValueError("Mage-Flow requires target_image/next_frame and input_image/current_frame")
+        cached_context = sample.get("mage_text_hidden_states", sample.get("context"))
+        cached_mask = sample.get("mage_text_attention_mask", sample.get("context_mask"))
+        encode = self.video_expert.vae.encode
+        ref_latent = encode(reference.to(self.video_expert.device, dtype=self.video_expert.torch_dtype))
+        target_latent = encode(target.to(self.video_expert.device, dtype=self.video_expert.torch_dtype))
+        if cached_context is not None and cached_mask is not None:
+            text_hidden = cached_context.to(self.device, dtype=self.torch_dtype)
+            text_mask = cached_mask.to(self.device, dtype=torch.bool)
+        else:
+            if self.video_expert.txt_enc is None:
+                raise RuntimeError("Mage text encoder is disabled; cached context/context_mask is required.")
+            instruction = sample.get("instruction", sample.get("prompt", sample.get("task")))
+            if instruction is None:
+                raise ValueError("Mage-Flow requires cached Mage text or instruction for online encoding")
+            def to_pil(image):
+                image = image.detach().float().cpu()
+                if image.min() < 0:
+                    image = (image + 1.0) * 0.5
+                image = image.clamp(0, 1)
+                return [Image.fromarray((x.permute(1, 2, 0).numpy() * 255).astype("uint8")) for x in image]
+            text_hidden, text_mask = self.video_expert.encode_edit_conditions(
+                [instruction] if isinstance(instruction, str) else instruction,
+                [to_pil(reference[i:i + 1]) for i in range(reference.shape[0])],
+                device=self.device,
+            )
+        action = sample["action"].to(self.device, dtype=self.torch_dtype)
+        action_is_pad = sample.get("action_is_pad")
+        if action_is_pad is not None:
+            action_is_pad = action_is_pad.to(self.device, dtype=torch.bool)
+        action_dim_is_pad = sample.get("action_dim_is_pad")
+        if action_dim_is_pad is not None:
+            action_dim_is_pad = action_dim_is_pad.to(self.device, dtype=torch.bool)
+        return {
+            "target_latent": target_latent.to(self.device, dtype=self.torch_dtype),
+            "ref_image_latents": ref_latent.to(self.device, dtype=self.torch_dtype),
+            "text_hidden_states": text_hidden,
+            "text_attention_mask": text_mask,
+            "action": action,
+            "action_is_pad": action_is_pad,
+            "action_dim_is_pad": action_dim_is_pad,
+        }
+
+    def _training_loss_mage_flow(self, sample, tiled: bool = False):
+        inputs = self.build_inputs_mage_flow(sample, tiled=tiled)
+        target = inputs["target_latent"]
+        action = inputs["action"]
+        b = int(target.shape[0])
+        tv = self.train_video_scheduler.sample_training_t(b, self.device, target.dtype)
+        ta = self.train_action_scheduler.sample_training_t(b, self.device, action.dtype)
+        nv, na = torch.randn_like(target), torch.randn_like(action)
+        noisy_target = self.train_video_scheduler.add_noise(target, nv, tv)
+        noisy_action = self.train_action_scheduler.add_noise(action, na, ta)
+        video_pre = self.video_expert.pre_dit(
+            noisy_target.flatten(2).transpose(1, 2), tv, inputs["text_hidden_states"],
+            inputs["text_attention_mask"], inputs["ref_image_latents"].flatten(2).transpose(1, 2),
+            img_shapes=[[(1, int(target.shape[-2]), int(target.shape[-1]))]
+                        * (2 * int(target.shape[0]))])
+        action_pre = self.action_expert.pre_dit(noisy_action, ta)
+        txt_len = int(video_pre["packed_context"].shape[1])
+        ref_len = self._mage_image_token_length(inputs["ref_image_latents"])
+        target_len = self._mage_image_token_length(target)
+        mot_attention_mask = self._build_mot_attention_mask_mage_flow_packed(
+            text_cu_lens=video_pre["txt_cu_lens"],
+            image_cu_lens=video_pre["img_cu_lens"],
+            action_cu_lens=action_pre["cu_lens"],
+            ref_len=ref_len,
+            target_len=target_len,
+            device=target.device,
+            text_attention_mask=inputs["text_attention_mask"],
+        )
+        out = self.mot(
+            {"video": video_pre["tokens"], "action": action_pre["tokens"]},
+            context_all={
+                "video": video_pre,
+                "action": action_pre,
+                "mot_attention_mask": mot_attention_mask,
+            },
+        )
+        pred_video = self.video_expert.post_dit(out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(out["action"], action_pre)
+        pred_video = pred_video.transpose(1, 2).reshape_as(target)
+        lv = F.mse_loss(
+            pred_video.float(),
+            self.train_video_scheduler.training_target(target, nv, tv).float(),
+        )
+        la_per_sample = self._compute_action_loss_per_sample(
+            pred_action,
+            self.train_action_scheduler.training_target(action, na, ta),
+            action_is_pad=inputs.get("action_is_pad"),
+            action_dim_is_pad=inputs.get("action_dim_is_pad"),
+        )
+        la = la_per_sample.mean()
+        return self.loss_lambda_video * lv + self.loss_lambda_action * la, {
+            "loss_video": float(lv.detach()), "loss_action": float(la.detach())
+        }
+
+    @staticmethod
+    def _mage_image_token_length(latent: torch.Tensor) -> int:
+        """Return the token count after Mage's [B, C, ...] -> [B, N, C] packing."""
+        if latent.ndim < 3:
+            raise ValueError(f"Mage latent must have at least 3 dimensions, got {tuple(latent.shape)}")
+        return int(latent.flatten(2).shape[2])
 
     @torch.no_grad()
     def _encode_ovis_u1_image_tokens(
@@ -2128,6 +2309,60 @@ class ImageWAM(torch.nn.Module):
             mask[:, :, t0:r0] &= text_valid[:, None, :]
         return {"double_joint": mask, "single": mask.clone()}
 
+    @torch.no_grad()
+    def _build_mot_attention_mask_mage_flow_packed(
+        self, text_cu_lens: torch.Tensor, image_cu_lens: torch.Tensor,
+        action_cu_lens: torch.Tensor, ref_len: int, target_len: int,
+        device: torch.device, text_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build a block-diagonal mask for Mage's stream-major packed layout."""
+        text_cu_lens = text_cu_lens.to(device=device, dtype=torch.long)
+        image_cu_lens = image_cu_lens.to(device=device, dtype=torch.long)
+        action_cu_lens = action_cu_lens.to(device=device, dtype=torch.long)
+        batch_size = int(text_cu_lens.numel() - 1)
+        if image_cu_lens.numel() != batch_size + 1 or action_cu_lens.numel() != batch_size + 1:
+            raise ValueError("Mage packed cu_lens must describe the same batch")
+        if text_attention_mask is not None and tuple(text_attention_mask.shape) != (
+            batch_size, int(text_cu_lens[-1] - text_cu_lens[0]) // batch_size
+        ):
+            # Variable-length text is represented by the cumulative lengths;
+            # validate only the batch dimension here.
+            if text_attention_mask.ndim != 2 or text_attention_mask.shape[0] != batch_size:
+                raise ValueError("Mage text mask batch dimension does not match packed cu_lens")
+        text_total = int(text_cu_lens[-1])
+        image_total = int(image_cu_lens[-1])
+        action_total = int(action_cu_lens[-1])
+        image_base, action_base = text_total, text_total + image_total
+        mask = torch.zeros(
+            1, text_total + image_total + action_total,
+            text_total + image_total + action_total,
+            dtype=torch.bool, device=device,
+        )
+        for index in range(batch_size):
+            t0, t1 = int(text_cu_lens[index]), int(text_cu_lens[index + 1])
+            i0, i1 = image_base + int(image_cu_lens[index]), image_base + int(image_cu_lens[index + 1])
+            a0, a1 = action_base + int(action_cu_lens[index]), action_base + int(action_cu_lens[index + 1])
+            target_end = i0 + int(target_len)
+            if i1 - target_end != int(ref_len):
+                raise ValueError("Mage image cu_lens do not match ref_len + target_len")
+            ref0, ref1 = target_end, i1
+            # Packed stream order is [text | target | reference | action].
+            # Reference is a fixed condition: stable tokens must not read the
+            # noisy target, while target may read both stable and target tokens.
+            mask[:, t0:t1, t0:t1] = True
+            mask[:, t0:t1, ref0:ref1] = True
+            mask[:, ref0:ref1, t0:t1] = True
+            mask[:, ref0:ref1, ref0:ref1] = True
+            mask[:, i0:ref1, t0:t1] = True
+            mask[:, i0:ref1, i0:ref1] = True
+            mask[:, a0:a1, t0:t1] = True
+            mask[:, a0:a1, ref0:ref1] = True
+            mask[:, a0:a1, a0:a1] = True
+            if text_attention_mask is not None:
+                valid = text_attention_mask[index, :t1 - t0].to(device=device, dtype=torch.bool)
+                mask[:, :, t0:t1] &= valid.view(1, 1, -1)
+        return mask
+
     def _compute_video_loss_per_sample(
         self,
         pred_video: torch.Tensor,
@@ -2615,6 +2850,8 @@ class ImageWAM(torch.nn.Module):
         }
 
     def training_loss(self, sample, tiled: bool = False):
+        if self.stack == "mage_flow":
+            return self._training_loss_mage_flow(sample, tiled=tiled)
         if self.stack == "dim":
             return self._training_loss_dim(sample, tiled=tiled)
         if self.stack == "flux2":
@@ -2899,6 +3136,147 @@ class ImageWAM(torch.nn.Module):
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
 
+    def _prepare_mage_infer_context(self, prompt, input_image, context, context_mask):
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Mage-Flow inference requires `prompt` or cached context/context_mask.")
+        if use_prompt:
+            if self.video_expert.txt_enc is None:
+                raise RuntimeError("Mage text encoder is disabled; provide cached context/context_mask.")
+            refs = input_image.detach().float().cpu()
+            if refs.min() < 0:
+                refs = (refs + 1.0) * 0.5
+            refs = refs.clamp(0, 1)
+            pil_refs = [Image.fromarray((x.permute(1, 2, 0).numpy() * 255).astype("uint8")) for x in refs]
+            context, context_mask = self.video_expert.encode_edit_conditions(
+                [prompt] * input_image.shape[0], [[image] for image in pil_refs], device=self.device)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context_mask.ndim != 2:
+                raise ValueError("Mage context/context_mask must be [B,L,D] and [B,L].")
+            context = context.to(device=self.device, dtype=self.torch_dtype)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool)
+        return context, context_mask
+
+    def _mage_flow_joint_step(self, target, reference, action, timestep_video, timestep_action,
+                              context, context_mask):
+        video_pre = self.video_expert.pre_dit(
+            x=target.flatten(2).transpose(1, 2),
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            ref_image_hidden_states=reference.flatten(2).transpose(1, 2),
+            img_shapes=[[(1, int(target.shape[-2]), int(target.shape[-1]))]
+                        * (2 * int(target.shape[0]))],
+        )
+        action_pre = self.action_expert.pre_dit(action, timestep_action)
+        mask = self._build_mot_attention_mask_mage_flow_packed(
+            text_cu_lens=video_pre["txt_cu_lens"],
+            image_cu_lens=video_pre["img_cu_lens"],
+            action_cu_lens=action_pre["cu_lens"],
+            ref_len=self._mage_image_token_length(reference),
+            target_len=self._mage_image_token_length(target),
+            device=target.device,
+            text_attention_mask=context_mask,
+        )
+        out = self.mot(
+            {"video": video_pre["tokens"], "action": action_pre["tokens"]},
+            context_all={"video": video_pre, "action": action_pre, "mot_attention_mask": mask},
+        )
+        return (
+            self.video_expert.post_dit(out["video"], video_pre).transpose(1, 2).reshape_as(target),
+            self.action_expert.post_dit(out["action"], action_pre),
+        )
+
+    @torch.no_grad()
+    def infer_action_mage_flow(self, prompt, input_image, action_horizon, proprio=None,
+                               context=None, context_mask=None, num_inference_steps=20,
+                               sigma_shift=None, seed=None, rand_device="cpu", tiled=False):
+        del tiled
+        self.eval()
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(f"`input_image` must be [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}")
+        h, w = input_image.shape[-2:]
+        if h % 16 or w % 16:
+            raise ValueError(f"Mage input spatial dims must be multiples of 16, got {(h, w)}")
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        context, context_mask = self._prepare_mage_infer_context(prompt, input_image, context, context_mask)
+        if proprio is not None:
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim != 2 or proprio.shape[0] != 1:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            context, context_mask = self._append_proprio_to_context(context, context_mask, proprio.to(self.device, self.torch_dtype))
+        reference = self.video_expert.encode_image_latents(input_image)
+        target = torch.zeros_like(reference)
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        action = torch.randn((1, action_horizon, self.action_expert.action_dim), generator=generator,
+                             device=rand_device, dtype=torch.float32).to(self.device, self.torch_dtype)
+        steps, deltas = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps, self.device, action.dtype, sigma_shift)
+        for step_t, delta in zip(steps, deltas):
+            tv = torch.zeros((1,), device=self.device, dtype=target.dtype)
+            ta = step_t.expand(1).to(device=self.device, dtype=action.dtype)
+            _, pred_action = self._mage_flow_joint_step(target, reference, action, tv, ta, context, context_mask)
+            action = self.infer_action_scheduler.step(pred_action, delta, action)
+        return {"action": action[0].detach().cpu().float()}
+
+    @torch.no_grad()
+    def infer_joint_mage_flow(self, prompt, input_image, num_video_frames, action_horizon,
+                              action=None, proprio=None, context=None, context_mask=None,
+                              num_inference_steps=20, sigma_shift=None, seed=None,
+                              rand_device="cpu", tiled=False, **_kwargs):
+        del action, tiled
+        self.eval()
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(f"`input_image` must be [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}")
+        if num_video_frames != 2:
+            raise ValueError("Mage-Flow ImageWAM inference supports exactly one target frame (num_video_frames=2).")
+        h, w = input_image.shape[-2:]
+        if h % 16 or w % 16:
+            raise ValueError(f"Mage input spatial dims must be multiples of 16, got {(h, w)}")
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        context, context_mask = self._prepare_mage_infer_context(prompt, input_image, context, context_mask)
+        if proprio is not None:
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim != 2 or proprio.shape[0] != 1:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            context, context_mask = self._append_proprio_to_context(context, context_mask, proprio.to(self.device, self.torch_dtype))
+        reference = self.video_expert.encode_image_latents(input_image)
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        target = torch.randn(reference.shape, generator=generator, device=rand_device, dtype=torch.float32).to(self.device, self.torch_dtype)
+        action = torch.randn((1, action_horizon, self.action_expert.action_dim), generator=generator,
+                             device=rand_device, dtype=torch.float32).to(self.device, self.torch_dtype)
+        steps_v, deltas_v = self.infer_video_scheduler.build_inference_schedule(num_inference_steps, self.device, target.dtype, sigma_shift)
+        steps_a, deltas_a = self.infer_action_scheduler.build_inference_schedule(num_inference_steps, self.device, action.dtype, sigma_shift)
+        for tv_step, dv, ta_step, da in zip(steps_v, deltas_v, steps_a, deltas_a):
+            tv = tv_step.expand(1).to(device=self.device, dtype=target.dtype)
+            ta = ta_step.expand(1).to(device=self.device, dtype=action.dtype)
+            pred_target, pred_action = self._mage_flow_joint_step(target, reference, action, tv, ta, context, context_mask)
+            target = self.infer_video_scheduler.step(pred_target, dv, target)
+            action = self.infer_action_scheduler.step(pred_action, da, action)
+        image = self.video_expert.decode_image_latents(target)[0].detach().cpu().float()
+        # Keep the public ImageWAM inference contract (`video`) while exposing
+        # `image` for callers that use Mage-Flow as a single-image editor.
+        return {
+            "video": self._image_tensor_to_pil_list(image.unsqueeze(0)),
+            "image": image,
+            "action": action[0].detach().cpu().float(),
+        }
+
     @torch.no_grad()
     def infer_joint(
         self,
@@ -2919,6 +3297,14 @@ class ImageWAM(torch.nn.Module):
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
     ) -> dict[str, Any]:
+        if self.stack == "mage_flow":
+            return self.infer_joint_mage_flow(
+                prompt=prompt, input_image=input_image, num_video_frames=num_video_frames,
+                action_horizon=action_horizon, action=action, proprio=proprio,
+                context=context, context_mask=context_mask,
+                num_inference_steps=num_inference_steps, sigma_shift=sigma_shift,
+                seed=seed, rand_device=rand_device, tiled=tiled,
+            )
         self.eval()
         if test_action_with_infer_action:
             if seed is None:
@@ -3097,6 +3483,13 @@ class ImageWAM(torch.nn.Module):
         tiled: bool = False,
         profile_infer_timing: bool = False,
     ) -> dict[str, Any]:
+        if self.stack == "mage_flow":
+            return self.infer_action_mage_flow(
+                prompt=prompt, input_image=input_image, action_horizon=action_horizon,
+                proprio=proprio, context=context, context_mask=context_mask,
+                num_inference_steps=num_inference_steps, sigma_shift=sigma_shift,
+                seed=seed, rand_device=rand_device, tiled=tiled,
+            )
         if self.stack == "dim":
             return self.infer_action_dim(
                 prompt=prompt,
@@ -4260,6 +4653,16 @@ class ImageWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
     ):
+        if self.stack == "mage_flow":
+            if action_horizon is None:
+                raise ValueError("`action_horizon` is required for Mage-Flow action inference.")
+            return self.infer_joint_mage_flow(
+                prompt=prompt, input_image=input_image, num_video_frames=num_frames,
+                action_horizon=action_horizon, action=action, proprio=proprio,
+                context=context, context_mask=context_mask,
+                num_inference_steps=num_inference_steps, sigma_shift=sigma_shift,
+                seed=seed, rand_device=rand_device, tiled=tiled,
+            )
         if self.stack == "ovis_u1":
             if action_horizon is None:
                 raise ValueError("`action_horizon` is required for Ovis-U1 action inference.")

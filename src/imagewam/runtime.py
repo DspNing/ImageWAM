@@ -392,6 +392,42 @@ def create_imagewam_flux2_klein(
     )
 
 
+def create_imagewam_mage_flow(
+    mage_flow_model_path: str,
+    mage_flow_src_path: str | None = None,
+    action_dit_config=None,
+    proprio_dim: int | None = None,
+    video_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    load_text_encoder: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """Create ImageWAM with the Mage-Flow joint image/action protocol."""
+    from .models.backbones.imagewam import ImageWAM
+
+    def as_dict(value):
+        if isinstance(value, DictConfig):
+            return OmegaConf.to_container(value, resolve=True)
+        return {} if value is None else dict(value)
+
+    return ImageWAM.from_mage_flow_pretrained(
+        mage_flow_model_path=mage_flow_model_path,
+        mage_flow_src_path=mage_flow_src_path,
+        action_dit_config=as_dict(action_dit_config),
+        proprio_dim=None if proprio_dim is None else int(proprio_dim),
+        video_scheduler=as_dict(video_scheduler),
+        action_scheduler=as_dict(action_scheduler),
+        loss=as_dict(loss),
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        load_text_encoder=bool(load_text_encoder),
+        device=device,
+        torch_dtype=model_dtype,
+    )
+
+
 def create_imagewam_dim(
     dim_model_path: str,
     sana_config_path: str,

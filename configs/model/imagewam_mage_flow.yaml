@@ -1,0 +1,27 @@
+_target_: imagewam.runtime.create_imagewam_mage_flow
+
+mage_flow_model_path: microsoft/Mage-Flow-Edit-Turbo
+mage_flow_src_path: ${oc.env:IMAGEWAM_MAGE_FLOW_SRC_PATH,third_party/Mage}
+proprio_dim: null
+load_text_encoder: false
+mot_checkpoint_mixed_attn: false
+
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  pretrained_path: null
+  max_action_horizon: 64
+
+video_scheduler:
+  train_shift: 6.0
+  infer_shift: 6.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 6.0
+  infer_shift: 6.0
+  num_train_timesteps: 1000
+
+loss:
+  lambda_video: 0.5
+  lambda_action: 1.0

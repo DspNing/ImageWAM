@@ -286,3 +286,5 @@ docs/model_card_*.md
 docs/huggingface_model_card_template.md
 
 task_lists/
+tests/
+docs/

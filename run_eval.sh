@@ -209,3 +209,5 @@ if [[ "${MODE}" == "plus" ]]; then
 else
     bash experiments/libero/run_libero_parallel_test.sh "${TASK_LIST}"
 fi
+
+# tmux kill-window -t libero_plus_batch

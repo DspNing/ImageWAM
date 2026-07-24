@@ -48,6 +48,12 @@ def setup_logging(
         is_main_process = _is_main_process()
 
     root_logger = logging.getLogger()
+
+    # `datasets`/LeRobot may probe the legacy parquet endpoint during local
+    # metadata initialization. Keep real warnings and errors, but suppress
+    # the repeated request-level INFO noise from the HTTP client.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     
     if is_main_process:
         # Save existing FileHandlers (e.g., from Hydra) if requested

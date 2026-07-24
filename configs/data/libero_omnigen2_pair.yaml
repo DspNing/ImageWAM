@@ -54,6 +54,7 @@ train:
   require_text_cache: false
   endpoint_frames_only: true
   qwen_text_cache_dir: ???
+  mage_text_cache_dir: null
   qwen_context_len: 128
   pretrained_norm_stats: null
   processor:

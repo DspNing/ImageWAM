@@ -495,6 +495,8 @@ class Wan22Trainer:
         context_mask = sample.get("context_mask", None)
         text_hidden_states = sample.get("text_hidden_states", None)
         text_attention_mask = sample.get("text_attention_mask", None)
+        mage_text_hidden_states = sample.get("mage_text_hidden_states", None)
+        mage_text_attention_mask = sample.get("mage_text_attention_mask", None)
         dataset_name = sample.get("dataset_name", None)
         embodiment = sample.get("embodiment", None)
         action_is_pad = sample.get("action_is_pad", None)
@@ -593,6 +595,20 @@ class Wan22Trainer:
                     "`text_hidden_states/text_attention_mask` must be [B,L,D]/[B,L], "
                     f"got {tuple(text_hidden_states.shape)} and {tuple(text_attention_mask.shape)}"
                 )
+        if mage_text_hidden_states is not None or mage_text_attention_mask is not None:
+            if mage_text_hidden_states is None or mage_text_attention_mask is None:
+                raise ValueError(
+                    "`mage_text_hidden_states/mage_text_attention_mask` must both exist in eval sample."
+                )
+            if mage_text_hidden_states.ndim == 2:
+                mage_text_hidden_states = mage_text_hidden_states.unsqueeze(0)
+            if mage_text_attention_mask.ndim == 1:
+                mage_text_attention_mask = mage_text_attention_mask.unsqueeze(0)
+            if mage_text_hidden_states.ndim != 3 or mage_text_attention_mask.ndim != 2:
+                raise ValueError(
+                    "`mage_text_hidden_states/mage_text_attention_mask` must be [B,L,D]/[B,L], "
+                    f"got {tuple(mage_text_hidden_states.shape)} and {tuple(mage_text_attention_mask.shape)}"
+                )
 
         return {
             "video": video,
@@ -609,6 +625,8 @@ class Wan22Trainer:
             "context_mask": context_mask,
             "text_hidden_states": text_hidden_states,
             "text_attention_mask": text_attention_mask,
+            "mage_text_hidden_states": mage_text_hidden_states,
+            "mage_text_attention_mask": mage_text_attention_mask,
             "action_horizon": action_horizon,
             "dataset_name": dataset_name,
             "embodiment": [embodiment] if isinstance(embodiment, str) else embodiment,
@@ -656,8 +674,15 @@ class Wan22Trainer:
         is_omnigen2_stack = model_stack == "omnigen2"
         is_ovis_u1_stack = model_stack == "ovis_u1"
         is_flux2_stack = model_stack == "flux2"
+        is_mage_flow_stack = model_stack == "mage_flow"
         is_dim_stack = model_stack == "dim"
-        is_image_prediction_stack = is_omnigen2_stack or is_ovis_u1_stack or is_flux2_stack or is_dim_stack
+        is_image_prediction_stack = (
+            is_omnigen2_stack
+            or is_ovis_u1_stack
+            or is_flux2_stack
+            or is_dim_stack
+            or is_mage_flow_stack
+        )
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         eval_indices = torch.randint(
             0,
@@ -701,7 +726,11 @@ class Wan22Trainer:
                     "seed": 42,
                     "tiled": False,
                 }
-                if (is_omnigen2_stack or is_flux2_stack) and sample.get("text_hidden_states") is not None:
+                if is_mage_flow_stack and sample.get("mage_text_hidden_states") is not None:
+                    infer_kwargs["prompt"] = None
+                    infer_kwargs["context"] = sample["mage_text_hidden_states"][0]
+                    infer_kwargs["context_mask"] = sample["mage_text_attention_mask"][0]
+                elif (is_omnigen2_stack or is_flux2_stack) and sample.get("text_hidden_states") is not None:
                     infer_kwargs["prompt"] = None
                     infer_kwargs["context"] = sample["text_hidden_states"][0]
                     infer_kwargs["context_mask"] = sample["text_attention_mask"][0]
@@ -838,6 +867,12 @@ class Wan22Trainer:
                     gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
                     vae_latents = model._encode_dim_image_latents(gt_final)
                     vae_image = model._decode_dim_image_latents(vae_latents)[0]
+                    vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
+                    vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
+                elif is_mage_flow_stack:
+                    gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+                    vae_latents = model.video_expert.encode_image_latents(gt_final)
+                    vae_image = model.video_expert.decode_image_latents(vae_latents)[0]
                     vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
                     vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
                 else:
