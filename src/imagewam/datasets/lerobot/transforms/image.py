@@ -90,7 +90,29 @@ class VideoAugmentation(nn.Module):
         gaussian_noise: dict | None = None,
         random_resized_crop: dict | None = None,
         rotate: dict | None = None,
+        camera_op_groups: list | None = None,
     ):
+        """
+        camera_op_groups: optional per-camera op policy, one entry per camera
+        (aligned to the leading camera dim, e.g. [agentview, wrist]). Each
+        entry is a collection of op groups drawn from {"color", "corrupt", "geom"}.
+
+        When set, augmentation becomes camera-differential:
+          - "color"   (color_jitter/gamma/exposure): factors sampled ONCE and
+            shared across every camera that opts in (Light/Background/Layout/
+            Robot perturbations are scene-wide).
+          - "corrupt" (gaussian_noise): per-camera, only where opted in.
+          - "geom"    (random_resized_crop/rotate): per-camera, only where
+            opted in.
+
+        Typical LIBERO-Plus setting: agentview gets {color, corrupt, geom}
+        (Camera/Noise/Background/Light all perturb it); wrist gets {color}
+        only (Camera/Noise leave it invariant, so it stays a clean anchor
+        while still seeing the shared lighting/texture variation).
+
+        When None, every camera receives the full pipeline with independent
+        parameters (legacy behaviour).
+        """
         super().__init__()
         self.p = float(p)
         self.augment_types = tuple(augment_types)
@@ -100,6 +122,26 @@ class VideoAugmentation(nn.Module):
         self.gaussian_noise = gaussian_noise or {}
         self.random_resized_crop = random_resized_crop or {}
         self.rotate = rotate or {}
+        self.camera_op_groups = self._normalize_camera_op_groups(camera_op_groups)
+
+    @staticmethod
+    def _normalize_camera_op_groups(camera_op_groups: list | None) -> list[set[str]] | None:
+        if camera_op_groups is None:
+            return None
+        allowed = {"color", "corrupt", "geom"}
+        normalized: list[set[str]] = []
+        for groups in camera_op_groups:
+            if isinstance(groups, str):
+                groups = [groups]
+            entry = set(groups)
+            invalid = entry - allowed
+            if invalid:
+                raise ValueError(
+                    f"Unknown op group(s) {invalid} in camera_op_groups; "
+                    f"allowed groups are {allowed}."
+                )
+            normalized.append(entry)
+        return normalized
 
     @staticmethod
     def _rand(device: torch.device) -> torch.Tensor:
@@ -254,12 +296,56 @@ class VideoAugmentation(nn.Module):
         frames = self._apply_rotate(frames)
         return frames.clamp(0.0, 1.0)
 
+    def _augment_clip_policy(self, frames: torch.Tensor) -> torch.Tensor:
+        """Camera-differential augmentation for a [num_cameras, T, C, H, W] clip.
+
+        See ``camera_op_groups`` in the constructor. Color factors are sampled
+        once and shared across all color-enabled cameras; corruption and
+        geometric ops are applied only to the cameras that opt into them.
+        """
+        self._validate_input_range(frames[0])
+        n_cameras = frames.shape[0]
+
+        groups = list(self.camera_op_groups)
+        if len(groups) < n_cameras:
+            # Pad missing trailing cameras with the full policy.
+            groups += [{"color", "corrupt", "geom"} for _ in range(n_cameras - len(groups))]
+
+        aug_type = self._sample_augment_type()
+        color_active = aug_type in {"color_only", "both"}
+        corrupt_active = aug_type in {"corrupt_only", "both"}
+
+        out = frames.clone()
+
+        # Shared color across all color-enabled cameras (one factor set for
+        # the whole clip, matching scene-wide lighting/texture changes).
+        if color_active:
+            color_idx = [i for i in range(n_cameras) if "color" in groups[i]]
+            if color_idx:
+                idx = torch.as_tensor(color_idx, device=frames.device, dtype=torch.long)
+                sub = out[idx]
+                sub = self._apply_color_jitter(sub)
+                sub = self._apply_gamma(sub)
+                sub = self._apply_exposure(sub)
+                out[idx] = sub
+
+        for i in range(n_cameras):
+            if corrupt_active and "corrupt" in groups[i]:
+                out[i] = self._apply_gaussian_noise(out[i])
+            if "geom" in groups[i]:
+                out[i] = self._apply_random_resized_crop(out[i])
+                out[i] = self._apply_rotate(out[i])
+
+        return out.clamp(0.0, 1.0)
+
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim == 5:
             if not torch.is_floating_point(frames):
                 raise TypeError(f"`VideoAugmentation` expects floating frames, got {frames.dtype}")
             if self._rand(torch.device("cpu")).item() >= self.p:
                 return frames
+            if self.camera_op_groups is not None:
+                return self._augment_clip_policy(frames)
             augmented = frames.clone()
             for cam_idx in range(frames.shape[0]):
                 augmented[cam_idx] = self._augment_frames(frames[cam_idx])

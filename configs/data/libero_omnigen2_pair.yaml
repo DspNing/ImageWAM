@@ -51,6 +51,13 @@ train:
       fill: mean
     exposure:
       ev_range: [-0.25, 0.25]
+    # LIBERO-Plus oriented per-camera policy (aligned to [agentview, wrist]).
+    # agentview: full (color+corrupt+geom) — Camera/Noise/Background/Light all perturb it.
+    # wrist: color only — Camera/Noise leave it invariant, so it stays a clean
+    #   visual anchor while still receiving the shared lighting/texture variation.
+    camera_op_groups:
+      - [color, corrupt, geom]   # idx 0 = agentview (left half)
+      - [color]                  # idx 1 = wrist (right half)
   require_text_cache: false
   endpoint_frames_only: true
   qwen_text_cache_dir: ???

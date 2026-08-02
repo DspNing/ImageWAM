@@ -41,7 +41,11 @@ def main() -> None:
     meta = MageFlowActionDiT.initialize_from_video(transformer.state_dict(), action)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": action.state_dict(), "meta": {
+    state_dict = {
+        key: value.detach().float().cpu().contiguous()
+        for key, value in action.state_dict().items()
+    }
+    torch.save({"state_dict": state_dict, "meta": {
         "source": args.model_path,
         "action_dim": args.action_dim,
         "copied": meta["copied"],

@@ -6,6 +6,13 @@ proprio_dim: null
 load_text_encoder: false
 mot_checkpoint_mixed_attn: false
 
+# torch.compile the MoT DiT forward for higher throughput. Applied inside the
+# model builder before accelerate/DeepSpeed wraps the module, so it stays on the
+# critical path of training. Leave false until you've validated a run.
+compile_dit: true
+compile_mode: default      # use "default" with ZeRO; avoid "reduce-overhead" (cudagraphs)
+compile_dynamic: true      # guard the variable packed text length against recompiles
+
 action_dit_config:
   action_dim: ${data.train.processor.action_output_dim}
   hidden_dim: 1024

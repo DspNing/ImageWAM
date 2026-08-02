@@ -75,6 +75,11 @@ class MoT(nn.Module):
             self.force_flash_attention,
         )
 
+        logger.info(f"Initialized MoT with experts: {self.expert_order}, num_layers={self.num_layers}")
+        for name in self.expert_order:
+            expert = self.mixtures[name]
+            logger.info(f"  Expert '{name}': num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B")
+
     @staticmethod
     def _split_modulation(block, t_mod: torch.Tensor):
         has_seq = len(t_mod.shape) == 4
@@ -1160,6 +1165,66 @@ class MoT(nn.Module):
                 start = end
         return tokens_all
 
+    @torch.no_grad()
+    def prefill_mage_flow_video_cache(self, video_tokens, video_state, attention_mask):
+        """Run the stable MageFlow text/reference prefix once for action inference."""
+        if self.block_protocol != "mage_flow":
+            raise ValueError("`prefill_mage_flow_video_cache` requires block_protocol='mage_flow'.")
+        video_expert = self.mixtures["video"]
+        vtr = video_expert.transformer
+        text = video_state["packed_context"]
+        vtemb, vrope = video_state["temb"], video_state["rope"]
+        vcu, tcu = video_state["img_cu_lens"], video_state["txt_cu_lens"]
+        if attention_mask.shape[-2:] != (
+            int(text.shape[1] + video_tokens.shape[1]),
+            int(text.shape[1] + video_tokens.shape[1]),
+        ):
+            raise ValueError("MageFlow prefix attention mask does not match video/text prefix.")
+
+        cache = []
+        for vblock in vtr.transformer_blocks:
+            state = vblock.prepare_qkv(
+                video_tokens, text, vtemb, vrope, tcu, vcu
+            )
+            mixed = self._mixed_attention(
+                state["q"], state["k"], state["v"], attention_mask
+            )
+            text, video_tokens = vblock.apply_attention(mixed, state)
+            cache.append({"k": state["k"], "v": state["v"]})
+        return {
+            "cache": cache,
+            "text": text,
+            "video": video_tokens,
+            "video_state": video_state,
+            "video_seq_len": int(text.shape[1] + video_tokens.shape[1]),
+        }
+
+    @torch.no_grad()
+    def forward_mage_flow_action_with_video_cache(
+        self, action_tokens, action_state, video_cache, attention_mask
+    ):
+        """Run one MageFlow action step against a cached text/reference prefix."""
+        if self.block_protocol != "mage_flow":
+            raise ValueError("`forward_mage_flow_action_with_video_cache` requires block_protocol='mage_flow'.")
+        action_expert = self.mixtures["action"]
+        atemb, arope = action_state["temb"], action_state["rope"]
+        acu = action_state["cu_lens"]
+        prefix_len = int(video_cache["video_seq_len"])
+        total_len = prefix_len + int(action_tokens.shape[1])
+        if attention_mask.shape[-2:] != (total_len, total_len):
+            raise ValueError("MageFlow action attention mask does not match cached prefix.")
+        action = action_tokens
+        for layer_idx, ablock in enumerate(action_expert.blocks):
+            state = ablock.prepare_qkv(action, None, atemb, arope, acu)
+            mixed = self._mixed_attention(
+                state["q"],
+                torch.cat((video_cache["cache"][layer_idx]["k"], state["k"]), dim=1),
+                torch.cat((video_cache["cache"][layer_idx]["v"], state["v"]), dim=1),
+                attention_mask[:, prefix_len:total_len, :total_len],
+            )
+            action = ablock.apply_attention(mixed, state)
+        return action
+
     def _forward_mage_flow(self, embeds_all, context_all):
         video_state = context_all.get("video") or {}
         action_state = context_all.get("action") or {}
@@ -1179,7 +1244,8 @@ class MoT(nn.Module):
         text = video_state["packed_context"]
         vtemb, vrope = video_state["temb"], video_state["rope"]
         vcu, tcu = video_state["img_cu_lens"], video_state["txt_cu_lens"]
-        atemb, acu = action_state["temb"], action_state["cu_lens"]
+        atemb, arope = action_state["temb"], action_state["rope"]
+        acu = action_state["cu_lens"]
         full_mask = context_all.get("mot_attention_mask")
         if full_mask is None:
             raise ValueError("Mage-Flow MoT requires a full packed mixed attention mask")
@@ -1202,7 +1268,9 @@ class MoT(nn.Module):
             def layer_fn(video_in, text_in, action_in):
                 v_state = vblock.prepare_qkv(
                     video_in, text_in, vtemb, vrope, tcu, vcu)
-                a_state = ablock.prepare_qkv(action_in, video_in, atemb, acu)
+                a_state = ablock.prepare_qkv(
+                    action_in, video_in, atemb, arope, acu 
+                )
                 q = torch.cat((v_state["q"], a_state["q"]), dim=1)
                 k = torch.cat((v_state["k"], a_state["k"]), dim=1)
                 value = torch.cat((v_state["v"], a_state["v"]), dim=1)

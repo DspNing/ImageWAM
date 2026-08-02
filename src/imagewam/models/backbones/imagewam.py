@@ -598,6 +598,9 @@ class ImageWAM(torch.nn.Module):
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         load_text_encoder: bool = True,
+        compile_dit: bool = False,
+        compile_mode: str = "default",
+        compile_dynamic: bool = True,
     ):
         from .mage_flow_action import MageFlowActionDiT
         from .mot import MoT
@@ -607,6 +610,13 @@ class ImageWAM(torch.nn.Module):
             mage_flow_model_path, mage_flow_src_path, device=device,
             torch_dtype=torch_dtype, load_text_encoder=load_text_encoder
         )
+        # Force deterministic VAE encode (posterior mean, no sampling). Our
+        # third_party mage_vae uses the constructor default sample_posterior=True
+        # and does NOT read vae/config.json (unlike Ning's config-driven build),
+        # so without this the target latent is re-sampled every step and adds an
+        # irreducible noise floor to the flow-matching velocity / video loss.
+        if getattr(video_expert, "vae", None) is not None:
+            video_expert.vae.sample_posterior = False
         action_cfg = dict(action_dit_config or {})
         action_dim = int(action_cfg.pop("action_dim"))
         action_expert = MageFlowActionDiT.from_video_transformer(
@@ -621,6 +631,27 @@ class ImageWAM(torch.nn.Module):
         mot = MoT(
             {"video": video_expert, "action": action_expert},
             mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn))
+        # Optionally torch.compile the MoT DiT forward. Done here (before the
+        # module is wrapped by accelerate/DeepSpeed in the trainer) so the
+        # compiled forward stays on the critical path of training.
+        # IMPORTANT: we compile the bound *method* (`mot.forward`) rather than
+        # `torch.compile(mot)`. The latter would turn `mot` into an
+        # ``OptimizedModule`` submodule of the top-level model, which trips an
+        # accelerate bug: ``has_compiled_regions`` returns True but
+        # ``unwrap_model`` then does ``model.__dict__["_orig_mod"]`` on the
+        # *top-level* model (which has no ``_orig_mod``) -> KeyError. Method
+        # compilation keeps `mot` a plain ``MoT`` instance, so
+        # ``has_compiled_regions`` is False while `self.mot(...)` still hits the
+        # compiled forward. As a bonus, state_dict keys are never prefixed with
+        # ``_orig_mod.``, so checkpoints are identical to the eager run.
+        #   - mode="default" (inductor) is DeepSpeed/ZeRO friendly; "reduce-overhead"
+        #     (cudagraphs) conflicts with ZeRO param hooks, so avoid it here.
+        #   - dynamic=True guards the variable packed-seq length (text token count
+        #     varies per sample) to prevent recompilation storms.
+        if compile_dit:
+            logger.info(
+                "torch.compile MoT DiT forward: mode=%s dynamic=%s", compile_mode, compile_dynamic)
+            mot.forward = torch.compile(mot.forward, mode=compile_mode, dynamic=compile_dynamic)
         sched_v = dict(video_scheduler or {})
         sched_a = dict(action_scheduler or {})
         if not {"train_shift", "infer_shift", "num_train_timesteps"} <= set(sched_a):
@@ -1405,8 +1436,13 @@ class ImageWAM(torch.nn.Module):
         cached_context = sample.get("mage_text_hidden_states", sample.get("context"))
         cached_mask = sample.get("mage_text_attention_mask", sample.get("context_mask"))
         encode = self.video_expert.vae.encode
-        ref_latent = encode(reference.to(self.video_expert.device, dtype=self.video_expert.torch_dtype))
-        target_latent = encode(target.to(self.video_expert.device, dtype=self.video_expert.torch_dtype))
+        with torch.no_grad():
+            ref_latent = encode(
+                reference.to(self.video_expert.device, dtype=self.video_expert.torch_dtype)
+            )
+            target_latent = encode(
+                target.to(self.video_expert.device, dtype=self.video_expert.torch_dtype)
+            )
         if cached_context is not None and cached_mask is not None:
             text_hidden = cached_context.to(self.device, dtype=self.torch_dtype)
             text_mask = cached_mask.to(self.device, dtype=torch.bool)
@@ -1426,6 +1462,11 @@ class ImageWAM(torch.nn.Module):
                 [instruction] if isinstance(instruction, str) else instruction,
                 [to_pil(reference[i:i + 1]) for i in range(reference.shape[0])],
                 device=self.device,
+            )
+        proprio = sample.get("proprio")
+        if self.proprio_encoder is not None or proprio is not None:
+            text_hidden, text_mask = self._append_proprio_to_context_if_enabled(
+                text_hidden, text_mask, proprio, source="MageFlow training"
             )
         action = sample["action"].to(self.device, dtype=self.torch_dtype)
         action_is_pad = sample.get("action_is_pad")
@@ -1507,9 +1548,22 @@ class ImageWAM(torch.nn.Module):
             action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
         )
         la = (action_loss_per_sample * action_weight).mean()
-        return self.loss_lambda_video * lv + self.loss_lambda_action * la, {
-            "loss_video": float(lv.detach()), "loss_action": float(la.detach())
+        loss_dict = {
+            # Keep logged components in the same scale as their contribution
+            # to the returned total loss (as in the other training stacks).
+            "loss_video": self.loss_lambda_video * float(lv.detach()),
+            "loss_action": self.loss_lambda_action * float(la.detach()),
         }
+        normal_video, wrist_video = torch.tensor_split(pred_video - target_video, 2, dim=-1)
+        normal_loss = normal_video.float().pow(2).flatten(1).mean(dim=1)
+        wrist_loss = wrist_video.float().pow(2).flatten(1).mean(dim=1)
+        loss_dict["loss_video_normal"] = self.loss_lambda_video * float(
+            (normal_loss * video_weight).mean().detach()
+        )
+        loss_dict["loss_video_wrist"] = self.loss_lambda_video * float(
+            (wrist_loss * video_weight).mean().detach()
+        )
+        return self.loss_lambda_video * lv + self.loss_lambda_action * la, loss_dict
 
     @staticmethod
     def _mage_image_token_length(latent: torch.Tensor) -> int:
@@ -2366,8 +2420,8 @@ class ImageWAM(torch.nn.Module):
             mask[:, t0:t1, ref0:ref1] = True
             mask[:, ref0:ref1, t0:t1] = True
             mask[:, ref0:ref1, ref0:ref1] = True
-            mask[:, i0:ref1, t0:t1] = True
-            mask[:, i0:ref1, i0:ref1] = True
+            mask[:, i0:ref0, t0:t1] = True
+            mask[:, i0:ref0, i0:ref1] = True
             mask[:, a0:a1, t0:t1] = True
             mask[:, a0:a1, ref0:ref1] = True
             mask[:, a0:a1, a0:a1] = True
@@ -3231,23 +3285,65 @@ class ImageWAM(torch.nn.Module):
             raise ValueError(f"Mage input spatial dims must be multiples of 16, got {(h, w)}")
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         context, context_mask = self._prepare_mage_infer_context(prompt, input_image, context, context_mask)
-        if proprio is not None:
-            if proprio.ndim == 1:
-                proprio = proprio.unsqueeze(0)
-            elif proprio.ndim != 2 or proprio.shape[0] != 1:
-                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
-            context, context_mask = self._append_proprio_to_context(context, context_mask, proprio.to(self.device, self.torch_dtype))
+        if self.proprio_encoder is not None or proprio is not None:
+            context, context_mask = self._append_proprio_to_context_if_enabled(
+                context, context_mask, proprio, source="MageFlow action inference"
+            )
         reference = self.video_expert.encode_image_latents(input_image)
-        target = torch.zeros_like(reference)
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        
+        ref_tokens = reference.flatten(2).transpose(1, 2)
+        empty_target = ref_tokens.new_zeros(ref_tokens.shape[0], 0, ref_tokens.shape[-1])
+        ref_h, ref_w = reference.shape[-2:]
+        # Keep the reference at MageFlow's training-time frame index 1 while
+        # representing the omitted target with a zero-token segment.
+        mage_img_shapes = [[(0, int(ref_h), int(ref_w)), (1, int(ref_h), int(ref_w))]]
+        
         action = torch.randn((1, action_horizon, self.action_expert.action_dim), generator=generator,
                              device=rand_device, dtype=torch.float32).to(self.device, self.torch_dtype)
         steps, deltas = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps, self.device, action.dtype, sigma_shift)
+
+        video_pre = self.video_expert.pre_dit(
+            x=empty_target,
+            timestep=torch.zeros((1,), device=self.device, dtype=reference.dtype),
+            context=context,
+            context_mask=context_mask,
+            ref_image_hidden_states=ref_tokens,
+            img_shapes=mage_img_shapes,
+        )
+        prefix_mask = self._build_mot_attention_mask_mage_flow_packed(
+            text_cu_lens=video_pre["txt_cu_lens"],
+            image_cu_lens=video_pre["img_cu_lens"],
+            action_cu_lens=torch.tensor([0, 0], device=self.device, dtype=torch.long),
+            ref_len=self._mage_image_token_length(reference),
+            target_len=0,
+            device=self.device,
+            text_attention_mask=context_mask,
+        )
+        video_cache = self.mot.prefill_mage_flow_video_cache(
+            video_pre["tokens"], video_pre, prefix_mask
+        )
+        batch, length = action.shape[:2]
+        acu = torch.arange(0, (batch + 1) * length, length, device=self.device, dtype=torch.int32)
+        full_mask = self._build_mot_attention_mask_mage_flow_packed(
+            text_cu_lens=video_pre["txt_cu_lens"],
+            image_cu_lens=video_pre["img_cu_lens"],
+            action_cu_lens=acu,
+            ref_len=self._mage_image_token_length(reference),
+            target_len=0,
+            device=self.device,
+            text_attention_mask=context_mask,
+        )
         for step_t, delta in zip(steps, deltas):
-            tv = torch.zeros((1,), device=self.device, dtype=target.dtype)
             ta = step_t.expand(1).to(device=self.device, dtype=action.dtype)
-            _, pred_action = self._mage_flow_joint_step(target, reference, action, tv, ta, context, context_mask)
+            action_pre = self.action_expert.pre_dit(
+                action, self._scheduler_timestep_to_unit(ta, self.infer_action_scheduler)
+            )
+            action_tokens = self.mot.forward_mage_flow_action_with_video_cache(
+                action_pre["tokens"], action_pre, video_cache, full_mask
+            )
+            pred_action = self.action_expert.post_dit(action_tokens, action_pre)
             action = self.infer_action_scheduler.step(pred_action, delta, action)
         return {"action": action[0].detach().cpu().float()}
 
@@ -3269,12 +3365,10 @@ class ImageWAM(torch.nn.Module):
             raise ValueError(f"Mage input spatial dims must be multiples of 16, got {(h, w)}")
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         context, context_mask = self._prepare_mage_infer_context(prompt, input_image, context, context_mask)
-        if proprio is not None:
-            if proprio.ndim == 1:
-                proprio = proprio.unsqueeze(0)
-            elif proprio.ndim != 2 or proprio.shape[0] != 1:
-                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
-            context, context_mask = self._append_proprio_to_context(context, context_mask, proprio.to(self.device, self.torch_dtype))
+        if self.proprio_encoder is not None or proprio is not None:
+            context, context_mask = self._append_proprio_to_context_if_enabled(
+                context, context_mask, proprio, source="MageFlow joint inference"
+            )
         reference = self.video_expert.encode_image_latents(input_image)
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         target = torch.randn(reference.shape, generator=generator, device=rand_device, dtype=torch.float32).to(self.device, self.torch_dtype)
@@ -3291,6 +3385,7 @@ class ImageWAM(torch.nn.Module):
         image = self.video_expert.decode_image_latents(target)[0].detach().cpu().float()
         # Keep the public ImageWAM inference contract (`video`) while exposing
         # `image` for callers that use Mage-Flow as a single-image editor.
+        # logger.info("Mage-Flow inference debug.")
         return {
             "video": self._image_tensor_to_pil_list(image.unsqueeze(0)),
             "image": image,
@@ -3315,16 +3410,8 @@ class ImageWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
-        test_action_with_infer_action: bool = True,
+        test_action_with_infer_action: bool = False,
     ) -> dict[str, Any]:
-        if self.stack == "mage_flow":
-            return self.infer_joint_mage_flow(
-                prompt=prompt, input_image=input_image, num_video_frames=num_video_frames,
-                action_horizon=action_horizon, action=action, proprio=proprio,
-                context=context, context_mask=context_mask,
-                num_inference_steps=num_inference_steps, sigma_shift=sigma_shift,
-                seed=seed, rand_device=rand_device, tiled=tiled,
-            )
         self.eval()
         if test_action_with_infer_action:
             if seed is None:
@@ -3342,7 +3429,28 @@ class ImageWAM(torch.nn.Module):
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
             )["action"]
-        
+
+        if self.stack == "mage_flow":
+            out = self.infer_joint_mage_flow(
+                prompt=prompt, input_image=input_image, num_video_frames=num_video_frames,
+                action_horizon=action_horizon, action=action, proprio=proprio,
+                context=context, context_mask=context_mask,
+                num_inference_steps=num_inference_steps, sigma_shift=sigma_shift,
+                seed=seed, rand_device=rand_device, tiled=tiled,
+            )
+            action_out = out["action"]
+            if test_action_with_infer_action:
+                max_abs_diff = (action_out - action_only_out).abs().max().item()
+                if not torch.allclose(action_out, action_only_out, atol=1e-2, rtol=1e-2):    
+                    logger.warning(
+                        f"Warning: Action from infer_joint and infer_action differ with max abs diff {max_abs_diff:.6f}. "
+                    )
+                else:
+                    logger.info(
+                        f"Info: Action from infer_joint and infer_action differ with max abs diff {max_abs_diff:.6f}."
+                    )
+            return out
+
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
         if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:

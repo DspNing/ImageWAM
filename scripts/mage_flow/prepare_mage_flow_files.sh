@@ -8,7 +8,17 @@ source "${SCRIPT_DIR}/../common.sh"
 imagewam_init "${SCRIPT_DIR}/../.."
 
 MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/checkpoints}"
-MAGE_FLOW_MODEL_ID="${MAGE_FLOW_MODEL_ID:-microsoft/Mage-Flow-Edit-Turbo}"
+MAGE_FLOW_VARIANT="base"        # 可选值：turbo | base | edit
+case "${MAGE_FLOW_VARIANT}" in
+  turbo) MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit-Turbo" ;;
+  base)  MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit-Base" ;;
+  edit)  MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit" ;;
+  *)
+    echo "MAGE_FLOW_VARIANT must be turbo, base, or edit; got: ${MAGE_FLOW_VARIANT}" >&2
+    exit 2
+    ;;
+esac
+MAGE_FLOW_MODEL_ID="${MAGE_FLOW_MODEL_ID:-${MAGE_FLOW_DEFAULT_MODEL_ID}}"
 MAGE_FLOW_ROOT="${MAGE_FLOW_ROOT:-${MODEL_ROOT}/mage_flow/$(basename "${MAGE_FLOW_MODEL_ID}")}"
 
 mkdir -p "${MAGE_FLOW_ROOT}"

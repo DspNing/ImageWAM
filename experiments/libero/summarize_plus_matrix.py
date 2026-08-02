@@ -208,54 +208,78 @@ def main():
 
     # ---- Print matrix ----
     short_headers = [CATEGORY_SHORT[c] for c in CATEGORY_KEYS]
+    total_done = sum(done.values())
+    total_all = sum(total.values())
+
+    # Each cell: "acc%(d/t)" e.g. "19.4%(376/376)" or "N/A(0/376)". Compute column
+    # widths from the longest cell so columns align regardless of done/total magnitude.
+    def _cell(suite: str, cat: str) -> str:
+        rates = cell.get((suite, cat), [])
+        n = done.get((suite, cat), 0)
+        t = total.get((suite, cat), 0)
+        a = sum(rates) / len(rates) if rates else float("nan")
+        a_s = f"{a:.1f}%" if a == a else "  N/A"
+        return f"{a_s}({n}/{t})"
+
+    def _avg_cell(num: float, n: int, t: int) -> str:
+        s = f"{num:.1f}%" if num == num else "  N/A"
+        return f"{s}({n}/{t})"
+
+    # Build all rows first to measure column widths.
+    # Leading "" occupies the suite-label column (col 0) so the category headers
+    # align with the data columns instead of shifting one column to the left.
+    header_cells = [""] + short_headers + ["Avg"]
+    rows: list[list[str]] = [header_cells]
+    for suite in BASE_SUITES:
+        r = [suite.replace("libero_", "")]
+        for cat in CATEGORY_KEYS:
+            r.append(_cell(suite, cat))
+        n = sum(done.get((suite, c), 0) for c in CATEGORY_KEYS)
+        t = sum(total.get((suite, c), 0) for c in CATEGORY_KEYS)
+        r.append(_avg_cell(suite_avg[suite], n, t))
+        rows.append(r)
+    avg_row = ["Avg"]
+    for cat in CATEGORY_KEYS:
+        n = sum(done.get((s, cat), 0) for s in BASE_SUITES)
+        t = sum(total.get((s, cat), 0) for s in BASE_SUITES)
+        avg_row.append(_avg_cell(cat_avg[cat], n, t))
+    avg_row.append(_avg_cell(overall, total_done, total_all))
+    rows.append(avg_row)
+
+    # Column widths: max over all rows (rows[0] is header, rest are data rows of same length).
+    n_cols = len(rows[1])
+    col_widths = [max(len(r[i]) for r in rows if i < len(r)) for i in range(n_cols)]
+    suite_col = col_widths[0]
+    sep = " " + " ".join("-" * w for w in col_widths)
 
     print()
     print("=" * 72)
     print(f"  Results: {os.path.basename(args.output_dir.rstrip('/'))}")
-    total_done = sum(done.values())
-    total_all = sum(total.values())
     print(f"  Completed: {total_done} / {total_all} tasks  ({100.0 * total_done / total_all if total_all else 0:.1f}%)")
     print("=" * 72)
     print()
+    print("  Cell = accuracy% (done/total)")
+    print()
 
-    # Header row
-    print(
-        f"  {'':<10}"
-        + "".join(f"{h:>9}" for h in short_headers)
-        + f"  {'Avg':>9}"
-    )
-    print("  " + "-" * (12 + 11 * len(short_headers) + 10))
+    def _fmt_row(r: list[str]) -> str:
+        # First column (suite) left-aligned, rest right-aligned; single space between.
+        parts = [f"{r[0]:<{suite_col}}"] + [f"{r[i]:>{col_widths[i]}}" for i in range(1, len(r))]
+        return " " + " ".join(parts)
 
-    # Suite rows
-    for suite in BASE_SUITES:
-        row = f"  {suite.replace('libero_', ''):<10}"
-        row += "".join(
-            f"{acc[suite][cat]:>9.2f}" if acc[suite][cat] == acc[suite][cat] else f"{'N/A':>9}"
-            for cat in CATEGORY_KEYS
-        )
-        sa = suite_avg[suite]
-        row += f"  {sa:>9.2f}" if sa == sa else f"  {'N/A':>9}"
-        print(row)
-
-    # Separator
-    print("  " + "-" * (12 + 11 * len(short_headers) + 10))
-
-    # Category avg row
-    row = f"  {'Avg':<10}"
-    row += "".join(
-        f"{cat_avg[cat]:>9.2f}" if cat_avg[cat] == cat_avg[cat] else f"{'N/A':>9}"
-        for cat in CATEGORY_KEYS
-    )
-    row += f"  {overall:>9.2f}" if overall == overall else f"  {'N/A':>9}"
-    print(row)
+    print(_fmt_row(rows[0]))   # header
+    print(sep)
+    for r in rows[1:-1]:       # suite rows
+        print(_fmt_row(r))
+    print(sep)
+    print(_fmt_row(rows[-1]))  # avg row
     print()
 
     # ---- Per-category detail ----
     print("Per-category detail (accuracy, done/total, avg time):")
     print(
-        f"  {'Category':<22} {'Acc(%)':>8} {'Done':>10} {'AvgTime(s)':>10}"
+        f"  {'Category':<12} {'Acc(%)':>8} {'Done':>12} {'AvgTime(s)':>10}"
     )
-    print("  " + "-" * 54)
+    print("  " + "-" * 46)
     for cat in CATEGORY_KEYS:
         n = sum(done.get((s, cat), 0) for s in BASE_SUITES)
         t = sum(total.get((s, cat), 0) for s in BASE_SUITES)
@@ -269,28 +293,43 @@ def main():
         avg_t = sum(durs) / len(durs) if durs else float("nan")
         acc_s = f"{ca:.2f}" if ca == ca else "N/A"
         t_s = f"{avg_t:.1f}" if durs else "N/A"
-        print(f"  {CATEGORY_SHORT[cat]:<22} {acc_s:>8} {f'{n}/{t}':>10} {t_s:>10}")
+        print(f"  {CATEGORY_SHORT[cat]:<12} {acc_s:>8} {f'{n}/{t}':>12} {t_s:>10}")
     print()
 
-    # ---- Save CSV ----
+    # ---- Save CSV (comma-separated, space-padded right-aligned for readability) ----
+    # Values padded with leading spaces so columns align under a monospace font, while
+    # still being valid CSV (commas are the delimiters; pandas/Excel parse fine).
     csv_path = os.path.join(args.output_dir, "summary_plus_matrix.csv")
-    w = 11
-    with open(csv_path, "w", encoding="utf-8") as f:
-        f.write(f"{'Suite':<{w}}," + ",".join(f"{CATEGORY_SHORT[c]:>{w}}" for c in CATEGORY_KEYS) + f",{'Avg':>{w}}\n")
-        for suite in BASE_SUITES:
-            parts = [suite.replace("libero_", "")]
-            for cat in CATEGORY_KEYS:
-                v = acc[suite][cat]
-                parts.append(f"{v:.4f}" if v == v else "-")
-            sa = suite_avg[suite]
-            parts.append(f"{sa:.4f}" if sa == sa else "-")
-            f.write(",".join(parts) + "\n")
-        parts = ["Avg"]
+
+    def _csv_num(v: float) -> str:
+        return f"{v:.2f}" if v == v else "-"
+
+    # Build all CSV rows first to measure column widths.
+    csv_rows: list[list[str]] = []
+    csv_rows.append(["Suite"] + [CATEGORY_SHORT[c] for c in CATEGORY_KEYS] + ["Avg"])
+    for suite in BASE_SUITES:
+        r = [suite.replace("libero_", "")]
         for cat in CATEGORY_KEYS:
-            v = cat_avg[cat]
-            parts.append(f"{v:.4f}" if v == v else "-")
-        parts.append(f"{overall:.4f}" if overall == overall else "-")
-        f.write(",".join(parts) + "\n")
+            r.append(_csv_num(acc[suite][cat]))
+        sa = suite_avg[suite]
+        r.append(_csv_num(sa))
+        csv_rows.append(r)
+    csv_avg = ["Avg"]
+    for cat in CATEGORY_KEYS:
+        csv_avg.append(_csv_num(cat_avg[cat]))
+    csv_avg.append(_csv_num(overall))
+    csv_rows.append(csv_avg)
+
+    n_csv_cols = len(csv_rows[1])
+    csv_widths = [max(len(r[i]) for r in csv_rows if i < len(r)) for i in range(n_csv_cols)]
+
+    with open(csv_path, "w", encoding="utf-8") as f:
+        for r in csv_rows:
+            # First column left-aligned, rest right-aligned.
+            parts = [f"{r[0]:<{csv_widths[0]}}"] + [
+                f"{r[i]:>{csv_widths[i]}}" for i in range(1, len(r))
+            ]
+            f.write(",".join(parts) + "\n")
     print(f"Saved: {csv_path}")
 
     # ---- Save JSON ----

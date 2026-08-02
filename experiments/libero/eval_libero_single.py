@@ -643,19 +643,37 @@ def _predict_action_chunk(
     else:
         infer_kwargs["prompt"] = prompt
 
+    endpoint_frames_only = bool(cfg.data.train.get("endpoint_frames_only", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
-        infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
+        infer_kwargs["num_video_frames"] = 2 if endpoint_frames_only else _get_num_video_frames(cfg)
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
-        infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
+        infer_kwargs["num_video_frames"] = 2 if endpoint_frames_only else _get_num_video_frames(cfg)
 
     with torch.no_grad():
         if visualize_future_video:
             pred = model.infer_joint(**infer_kwargs)
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+            if endpoint_frames_only:
+                # Endpoint-frame inference returns only the future target.
+                # The rollout clip still starts with the current observation.
+                current_image = _frame_to_rgb_array(imgs).astype(np.uint8)
+                if predicted_future_frames:
+                    target_h, target_w = np.asarray(predicted_future_frames[0]).shape[:2]
+                    current_image = np.asarray(
+                        Image.fromarray(current_image).resize(
+                            (target_w, target_h), resample=Image.BILINEAR
+                        )
+                    )
+                predicted_future_frames.insert(
+                    0, Image.fromarray(current_image)
+                )
         else:
             pred = model.infer_action(**infer_kwargs)
+            # infer_kwargs["num_video_frames"] = 2 if endpoint_frames_only else _get_num_video_frames(cfg)
+            # pred = model.infer_joint(**infer_kwargs)
+
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
@@ -701,8 +719,12 @@ def run_single_episode(
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
+    endpoint_frames_only = bool(cfg.data.train.get("endpoint_frames_only", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
-    capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
+    if endpoint_frames_only:
+        capture_steps = {int(cfg.data.train.action_video_freq_ratio)}
+    else:
+        capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
     env.reset()
     obs = env.set_init_state(initial_state)

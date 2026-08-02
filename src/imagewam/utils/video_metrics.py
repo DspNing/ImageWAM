@@ -28,6 +28,25 @@ def _gaussian_kernel_2d(kernel_size: int, sigma: float, channels: int, device: t
     return kernel_2d.repeat(channels, 1, 1, 1)
 
 
+def split_cameras(
+    video_tensor: torch.Tensor,
+    num_cameras: int,
+    concat_axis: str = "horizontal",
+) -> list[torch.Tensor]:
+    """Split a multi-camera video tensor back into per-camera tensors.
+
+    Expects shape [3, T, H, W]. Multi-camera clips are stored as several views
+    concatenated into one image: ``"horizontal"`` concatenates along width
+    (split ``W``), ``"vertical"`` along height (split ``H``). A ``num_cameras``
+    of 1 (or fewer) returns the tensor unchanged in a single-element list.
+    """
+    if num_cameras <= 1:
+        return [video_tensor]
+    if concat_axis == "vertical":
+        return list(torch.chunk(video_tensor, num_cameras, dim=-2))
+    return list(torch.chunk(video_tensor, num_cameras, dim=-1))
+
+
 def video_psnr(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0, eps: float = 1e-8) -> float:
     """
     Compute average PSNR over all frames.

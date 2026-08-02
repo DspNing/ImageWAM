@@ -402,6 +402,9 @@ def create_imagewam_mage_flow(
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     load_text_encoder: bool = True,
+    compile_dit: bool = False,
+    compile_mode: str = "default",
+    compile_dynamic: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -423,6 +426,9 @@ def create_imagewam_mage_flow(
         loss=as_dict(loss),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         load_text_encoder=bool(load_text_encoder),
+        compile_dit=bool(compile_dit),
+        compile_mode=str(compile_mode),
+        compile_dynamic=bool(compile_dynamic),
         device=device,
         torch_dtype=model_dtype,
     )

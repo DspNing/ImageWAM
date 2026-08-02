@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export IMAGEWAM_MEM_TRIM_EVERY="${IMAGEWAM_MEM_TRIM_EVERY:-50}"
+export IMAGEWAM_MEM_TRIM_GC="${IMAGEWAM_MEM_TRIM_GC:-1}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../common.sh"
 imagewam_init "${SCRIPT_DIR}/../.."
@@ -9,9 +12,23 @@ GPU_PER_NODE="${GPU_PER_NODE:-8}"
 TASK_TYPE="${TASK_TYPE:-libero}"
 MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/checkpoints}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
-MAGE_FLOW_MODEL_ID="${MAGE_FLOW_MODEL_ID:-microsoft/Mage-Flow-Edit}"
+MAGE_FLOW_VARIANT="${MAGE_FLOW_VARIANT:-turbo}"
+case "${MAGE_FLOW_VARIANT}" in
+  turbo) MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit-Turbo" ;;
+  turbo_2b) MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit-Turbo-2B" ;;
+  base)  MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit-Base" ;;
+  base_2b) MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit-Base-2B" ;;
+  edit)  MAGE_FLOW_DEFAULT_MODEL_ID="microsoft/Mage-Flow-Edit" ;;
+  *)
+    echo "MAGE_FLOW_VARIANT must be turbo, base, or edit; got: ${MAGE_FLOW_VARIANT}" >&2
+    exit 2
+    ;;
+esac
+MAGE_FLOW_MODEL_ID="${MAGE_FLOW_MODEL_ID:-${MAGE_FLOW_DEFAULT_MODEL_ID}}"
 MAGE_FLOW_MODEL_PATH="${MAGE_FLOW_MODEL_PATH:-${MODEL_ROOT}/mage_flow/$(basename "${MAGE_FLOW_MODEL_ID}")}"
-ACTION_INIT="${ACTION_INIT:-${MODEL_ROOT}/action_dit_mage_flow_${TASK_TYPE}_init.pt}"
+# Set MAGE_FLOW_MODEL_PATH to the output of prepare_mage_turbo_2b.sh to train the
+# six-layer (~2B DiT) variant initialized from Mage-Flow-Edit-Turbo.
+ACTION_INIT="${ACTION_INIT:-${MODEL_ROOT}/action_dit_mage_flow_${MAGE_FLOW_VARIANT}_${TASK_TYPE}_init.pt}"
 ZERO_STAGE="${ZERO_STAGE:-1}"
 
 case "${TASK_TYPE}" in
@@ -31,10 +48,15 @@ case "${TASK_TYPE}" in
   *) echo "TASK_TYPE must be libero or robotwin" >&2; exit 2 ;;
 esac
 
-export MAGE_FLOW_MODEL_PATH ZERO_STAGE TASK_TYPE
+export MAGE_FLOW_MODEL_ID MAGE_FLOW_VARIANT MAGE_FLOW_MODEL_PATH ZERO_STAGE TASK_TYPE
 imagewam_require_env DATA_ROOT
 
 if [ ! -d "${MAGE_FLOW_MODEL_PATH}" ]; then
+  if [ "${MAGE_FLOW_VARIANT}" = *_2b ]; then
+    echo "Missing 2B Mage-Flow checkpoint: ${MAGE_FLOW_MODEL_PATH}" >&2
+    echo "Run scripts/mage_flow/prepare_mage_turbo_2b.sh first." >&2
+    exit 1
+  fi
   MAGE_FLOW_MODEL_ID="${MAGE_FLOW_MODEL_ID}" MAGE_FLOW_ROOT="${MAGE_FLOW_MODEL_PATH}" \
     imagewam_run bash "${SCRIPT_DIR}/prepare_mage_flow_files.sh"
 fi

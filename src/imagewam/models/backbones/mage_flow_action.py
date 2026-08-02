@@ -74,7 +74,8 @@ class MageFlowActionBlock(nn.Module):
         x = (x * (1 + scale) + shift).reshape(1, -1, x.shape[-1])
         return x, gate
 
-    def prepare_qkv(self, hidden_states, encoder_hidden_states, temb, action_cu_lens=None):
+    def prepare_qkv(self, hidden_states, encoder_hidden_states, temb,
+                    action_rope=None, action_cu_lens=None):
         del encoder_hidden_states
         if action_cu_lens is None:
             action_cu_lens = torch.tensor(
@@ -89,6 +90,10 @@ class MageFlowActionBlock(nn.Module):
         k = attn.to_k(img_modulated).unflatten(-1, (attn.heads, -1))
         v = attn.to_v(img_modulated).unflatten(-1, (attn.heads, -1))
         q, k = attn.norm_q(q), attn.norm_k(k)
+
+        from mage_flow.models.modules.mage_layers import apply_rotary_emb_mageflow
+        q = apply_rotary_emb_mageflow(q, action_rope)
+        k = apply_rotary_emb_mageflow(k, action_rope)
         return {
             "q": q.flatten(-2), "k": k.flatten(-2), "v": v.flatten(-2),
             "residual": hidden_states,
@@ -115,7 +120,7 @@ class MageFlowActionDiT(nn.Module):
 
     def __init__(self, action_dim: int, video_hidden_dim: int, num_heads: int,
                  attn_head_dim: int, depth: int, action_hidden_dim: int = 1024,
-                 max_action_horizon: int = 64):
+                 max_action_horizon: int = 64, rope_axes_dim: list[int] | None = None):
         super().__init__()
         self.action_dim = int(action_dim)
         self.hidden_dim = int(action_hidden_dim)
@@ -124,6 +129,18 @@ class MageFlowActionDiT(nn.Module):
         self.num_kv_heads = self.num_heads
         self.attn_head_dim = int(attn_head_dim)
         self.max_action_horizon = int(max_action_horizon)
+        self.rope_axes_dim = list(rope_axes_dim or [32, 32, 64])
+        if sum(self.rope_axes_dim) != self.attn_head_dim:
+            raise ValueError(
+                f"rope_axes_dim must sum to attn_head_dim={self.attn_head_dim}, "
+                f"got {self.rope_axes_dim}"
+            )
+        from .mage_flow_imports import ensure_mage_flow_importable
+        ensure_mage_flow_importable()
+        from mage_flow.models.modules.mage_layers import MageFlowEmbedRope
+        self.rope_embed = MageFlowEmbedRope(
+            theta=10000, axes_dim=self.rope_axes_dim, scale_rope=True
+        )
         self.action_encoder = nn.Linear(self.action_dim, self.hidden_dim)
         self.blocks = nn.ModuleList([
             MageFlowActionBlock(self.hidden_dim, self.video_hidden_dim,
@@ -147,7 +164,9 @@ class MageFlowActionDiT(nn.Module):
                     int(transformer.num_attention_heads),
                     int(transformer.attention_head_dim),
                     len(transformer.transformer_blocks), action_hidden_dim,
-                    max_action_horizon).to(device=device, dtype=torch_dtype)
+                    max_action_horizon,
+                    rope_axes_dim=list(transformer.axes_dim),
+                    ).to(device=device, dtype=torch_dtype)
         if pretrained_path:
             payload = torch.load(pretrained_path, map_location="cpu")
             state = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
@@ -201,7 +220,15 @@ class MageFlowActionDiT(nn.Module):
                 # hidden state, so only shape-changing projections are resized.
                 candidates.append(f"transformer_blocks.{layer}.{suffix}")
             elif key.startswith("time_embed."):
-                candidates.append(key.replace("time_embed.", "time_text_embed.timestep_embedder.linear_1."))
+                # Mage's timestep embedder has two linear layers. Preserve the
+                # action MLP's layer ordering instead of mapping both layers to
+                # Mage's first projection.
+                layer_name, parameter = key.removeprefix("time_embed.").split(".", 1)
+                mage_layer = {"0": "linear_1", "2": "linear_2"}.get(layer_name)
+                if mage_layer is not None:
+                    candidates.append(
+                        f"time_text_embed.timestep_embedder.{mage_layer}.{parameter}"
+                    )
             for source_key in candidates:
                 if source_key in video_state:
                     value = video_state[source_key]
@@ -234,10 +261,13 @@ class MageFlowActionDiT(nn.Module):
         temb = self.time_embed(temb)
         cu = torch.arange(0, (batch + 1) * length, length,
                           device=encoded.device, dtype=torch.int32)
+        rope = self.rope_embed([(length, 1, 1)], device=encoded.device)
+        rope = rope.repeat(batch, 1)
         return {
             "tokens": encoded.reshape(1, -1, encoded.shape[-1]),
             "temb": temb,
             "cu_lens": cu,
+            "rope": rope,
             "batch_size": int(batch),
             "length": int(length),
             "timestep": timestep,

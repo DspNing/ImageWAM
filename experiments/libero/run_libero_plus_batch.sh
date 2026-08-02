@@ -153,21 +153,25 @@ run_libero_plus_batch() {
 
         tmux send-keys -t "$SESSION_NAME:$pane_info" "clear" C-m 2>/dev/null
 
-        CONDA_ENV="${CONDA_ENV:-imagewam}"
+        CONDA_ENV="${CONDA_ENV:-mageflow}"
         WORKER_THREADS="${WORKER_THREADS:-3}"
 
         # Build the worker command — activate conda env, then launch eval_libero_batch.py
         local model_paths=""
-        if [ -n "${FLUX2_SRC:-}" ]; then
+        if [[ "${CONFIG}" == *flux2* ]] && [ -n "${FLUX2_SRC:-}" ]; then
             model_paths+="model.flux2_src_path=$FLUX2_SRC "
             model_paths+="model.flux2_model_path=$FLUX2_MODEL_PATH "
             model_paths+="model.ae_model_path=$FLUX2_AE_MODEL_PATH "
             model_paths+="model.qwen3_model_spec=${FLUX2_QWEN3_MODEL_SPEC:-Qwen/Qwen3-4B} "
         fi
-        if [ -n "${OMNIGEN2_SRC:-}" ]; then
+        if [[ "${CONFIG}" == *omnigen2* ]] && [ -n "${OMNIGEN2_SRC:-}" ]; then
             model_paths+="model.omnigen2_model_path=$OMNIGEN2_MODEL_PATH "
             model_paths+="model.omnigen2_vae_path=$OMNIGEN2_MODEL_PATH "
             model_paths+="model.qwen_path=$QWEN_MODEL_PATH "
+        fi
+        if [ -n "${MAGE_FLOW_MODEL_PATH:-}" ]; then
+            model_paths+="model.mage_flow_model_path=$MAGE_FLOW_MODEL_PATH "
+            model_paths+="model.load_text_encoder=true "
         fi
 
         local launch_cmd="cd $ROOT_DIR && \

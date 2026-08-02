@@ -128,6 +128,10 @@ class MageFlowVideoExpert(nn.Module):
             x = torch.cat([x, ref_image_hidden_states], dim=1)
         if context.ndim != 3:
             raise ValueError("Mage text context must be [B,L,D]")
+        if context_mask is None and context.shape[0] > 1:
+            raise ValueError(
+                "Packed MageFlow text requires context_mask for batch_size > 1."
+            )
         transformer = self.transformer
         img = transformer.img_in(x)
         if context_mask is None:
@@ -139,7 +143,18 @@ class MageFlowVideoExpert(nn.Module):
             packed_context = torch.cat(txt_rows, dim=0)
             txt = transformer.txt_in(transformer.txt_norm(packed_context.unsqueeze(0)))
         temb = transformer.time_text_embed(timestep.to(img.dtype), img)
-        rope = transformer.pos_embed(img_shapes, device=img.device)
+        rope_shapes = img_shapes
+        rope_skip = 0
+        if img_shapes and img_shapes[0] and int(img_shapes[0][0][0]) == 0:
+            # MageFlow's RoPE implementation cannot reshape a zero-frame
+            # segment. Generate the omitted target segment as a temporary
+            # frame, then retain only the reference frequencies (frame 1).
+            zero_frame = img_shapes[0][0]
+            rope_shapes = [[(1, int(zero_frame[1]), int(zero_frame[2])), *img_shapes[0][1:]]]
+            rope_skip = int(zero_frame[1]) * int(zero_frame[2])
+        rope = transformer.pos_embed(rope_shapes, device=img.device)
+        if rope_skip:
+            rope = rope[rope_skip:]
         img_cu = torch.arange(0, (img.shape[0] + 1) * img.shape[1], img.shape[1],
                               device=img.device, dtype=torch.int32)
         txt_cu = torch.tensor([0] + [sum(lengths[:i + 1]) for i in range(len(lengths))],

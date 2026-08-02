@@ -21,7 +21,7 @@ from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
-from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
+from .utils.video_metrics import pil_frames_to_video_tensor, split_cameras, video_psnr, video_ssim
 
 logger = get_logger(__name__)
 
@@ -692,6 +692,12 @@ class Wan22Trainer:
         ).tolist()
 
         local_metric_rows = []
+        # Per-camera diagnostic metrics. Cameras are concatenated into one image
+        # (see `concat_multi_camera`); we split pred/vae/gt back per view to tell
+        # whether reconstruction error is concentrated in a specific camera (e.g.
+        # wrist) and whether it is VAE round-trip (dg) or diffusion rollout (rg).
+        eval_camera_keys: list[str] = []
+        eval_concat_axis = getattr(self.val_dataset, "concat_multi_camera", None) or "horizontal"
         video_path = None
         val_video_augmentation = getattr(self.val_dataset, "video_augmentation", None)
         val_has_video_augmentation = hasattr(self.val_dataset, "video_augmentation")
@@ -892,6 +898,33 @@ class Wan22Trainer:
                 psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
                 ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
 
+                # Per-camera PSNR/SSIM (rg/rd/dg) by splitting the concatenated
+                # canvas back into individual views. Order matches shape_meta
+                # images (e.g. [image, wrist_image]); row appends 6 cols per cam.
+                if not eval_camera_keys:
+                    try:
+                        _proc = self._get_eval_processor(sample)
+                        eval_camera_keys = [str(m["key"]) for m in _proc.shape_meta.get("images", [])]
+                    except Exception:
+                        eval_camera_keys = []
+                per_cam_row: list[float] = []
+                _num_cameras = len(eval_camera_keys)
+                if _num_cameras > 1:
+                    _pred_cams = split_cameras(pred_video_tensor, _num_cameras, eval_concat_axis)
+                    _vae_cams = split_cameras(vae_video_tensor, _num_cameras, eval_concat_axis)
+                    _gt_cams = split_cameras(gt_video_tensor, _num_cameras, eval_concat_axis)
+                    for _ci in range(_num_cameras):
+                        per_cam_row.extend(
+                            [
+                                video_psnr(_pred_cams[_ci], _gt_cams[_ci]),
+                                video_ssim(_pred_cams[_ci], _gt_cams[_ci]),
+                                video_psnr(_pred_cams[_ci], _vae_cams[_ci]),
+                                video_ssim(_pred_cams[_ci], _vae_cams[_ci]),
+                                video_psnr(_vae_cams[_ci], _gt_cams[_ci]),
+                                video_ssim(_vae_cams[_ci], _gt_cams[_ci]),
+                            ]
+                        )
+
                 stitched_video_tensor = torch.cat(
                     [pred_video_tensor, vae_video_tensor, gt_video_tensor],
                     dim=2,
@@ -922,6 +955,7 @@ class Wan22Trainer:
                         float(action_l2) if action_valid else 0.0,
                         float(action_l1) if action_valid else 0.0,
                         1.0 if action_valid else 0.0,
+                        *per_cam_row,
                     ]
                 )
         finally:
@@ -955,6 +989,16 @@ class Wan22Trainer:
             "video_path": video_path,
             "num_samples": int(gathered_metrics.shape[0]),
         }
+        # Per-camera aggregated metrics (6 cols per camera, appended after col 9).
+        # Names: <metric>__<camera_key>, e.g. psnr_dg__wrist_image.
+        if eval_camera_keys and gathered_metrics.shape[1] > 10:
+            per_cam_mean = gathered_metrics[:, 10:].mean(dim=0)
+            _cam_metric_names = ["psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg"]
+            _idx = 0
+            for _cam_key in eval_camera_keys:
+                for _mname in _cam_metric_names:
+                    result[f"{_mname}__{_cam_key}"] = float(per_cam_mean[_idx].item())
+                    _idx += 1
         if action_l2_mean is not None:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
@@ -1230,6 +1274,16 @@ class Wan22Trainer:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
+                            per_cam_keys = sorted(k for k in metrics if "__" in k)
+                            if per_cam_keys:
+                                # Compact per-camera summary: rollout-vs-GT and
+                                # VAE-round-trip PSNR per camera (rg/dg).
+                                for _mk in ("psnr_rg", "psnr_dg"):
+                                    _keys = [k for k in per_cam_keys if k.startswith(_mk + "__")]
+                                    if _keys:
+                                        description += " " + " ".join(
+                                            "%s=%.3f" % (k, metrics[k]) for k in _keys
+                                        )
                             logger.info(description)
                             eval_payload = {
                                 "eval/num_samples": int(metrics["num_samples"]),
@@ -1245,6 +1299,8 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            for _k in per_cam_keys:
+                                eval_payload[f"eval/{_k}"] = float(metrics[_k])
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
