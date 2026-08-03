@@ -15,35 +15,39 @@
 # ==================== 参数块（按需修改）====================
 MODE="plus"                                       # "plus" | "master"
 GPUS="4,5"                                    # 用哪些卡，逗号分隔
-MAGE_FLOW_VARIANT="${MAGE_FLOW_VARIANT:-base_2b}"
+MAGE_FLOW_VARIANT="${MAGE_FLOW_VARIANT:-base}"
 
 #   plus : 传入任务清单文件路径（或由调度脚本自动生成）
 #   master: 传入任务清单文件路径
-TASK_LIST="./task_lists/libero_plus_all.txt"                                      # 留空 = 自动生成任务列表
+# TASK_LIST="./task_lists/libero_plus_all.txt"                                      # 全量 libero-plus
+TASK_LIST="./task_lists/libero_plus_robot_initial_states.txt"                       # 仅 robot 扰动子集
 
 # checkpoint 路径（必填）：
 # CKPT="./checkpoints/imagewam_release/libero/flux2_klein_4b/model.pt"
-CKPT="./runs/libero_mage_flow_imagewam/2026-07-30_21-11-22/checkpoints/weights/step_042000.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
+CKPT="/data/NingZijian/ImageWAM/runs/libero_mage_flow_imagewam/mageflow-4b-112*224/checkpoints/weights/step_042000.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
 
 # dataset_stats 路径（留空 = 自动从 ckpt 父目录查找）：
 STATS="./data/dataset_stats.json"
 
 NUM_TRIALS=""                                      # 留空：plus→1 / master→25；填数字则强制覆盖
 NUM_INFERENCE_STEPS="10"                             # 每次动作预测的去噪步数
+REPLAN_STEPS="5"                                    # replan 间隔（每 N 步重新观测+推理）; 留空=用 batch 脚本默认 12
 
 # —— 视频控制 ——
-SAVE_VIDEO="false"                                #  是否保存 rollout 视频
-MAX_VIDEOS_PER_WORKER="5"                         #  plus 模式：每个 worker 最多保存多少个 task 的视频
-VISUALIZE_FUTURE_VIDEO="false"                    #  是否可视化未来动作视频
+SAVE_VIDEO="true"                                #  是否保存 rollout 视频
+MAX_VIDEOS_PER_WORKER="50"                         #  plus 模式：每个 worker 最多保存多少个 task 的视频
+VISUALIZE_FUTURE_VIDEO="true"                    #  是否infer joint
 
 # —— 以下一般不用改 ——
 CONFIG="libero_mage_flow_imagewam"      # configs/task/ 下的配置名（不带 .yaml）
-MAX_TASKS_PER_GPU=5                               # 每卡并发任务数
+MAX_TASKS_PER_GPU=2                              # 每卡并发任务数
 
 # 用哪个 conda env 跑 worker。
 CONDA_ENV="mageflow"
 
 WORKERS_PER_GPU=""                                 # 留空：默认 = MAX_TASKS_PER_GPU
+
+SHARED_ENCODER="${SHARED_ENCODER:-true}"           # true=每卡共享一个 text encoder(省显存, 多塞 worker) | false=每 worker 在线加载(默认)
 
 case "${MAGE_FLOW_VARIANT}" in
     turbo) MAGE_FLOW_DEFAULT_MODEL_PATH="${MODEL_ROOT:-./checkpoints}/mage_flow/Mage-Flow-Edit-Turbo" ;;
@@ -93,7 +97,7 @@ export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 
 
 # 切换 libero 的 bddl/init 路径配置(根据 MODE 指向不同目录)
-LIBERO_PKG_DIR="${LIBERO_PKG_DIR:-$(pwd)/third_party/LIBERO-${MODE}}"
+export LIBERO_PKG_DIR="${LIBERO_PKG_DIR:-$(pwd)/third_party/LIBERO-${MODE}}"
 LIBERO_CFG_DIR="${HOME}/.libero"
 mkdir -p "${LIBERO_CFG_DIR}"
 cat > "${LIBERO_CFG_DIR}/config.yaml" << EOF
@@ -121,10 +125,12 @@ export CONFIG
 export CUDA_VISIBLE_DEVICES="${GPUS}"
 export MAX_TASKS_PER_GPU
 export NUM_TRIALS
+export REPLAN_STEPS
 export CKPT
 export RESULTS_SUBDIR
 export CONDA_ENV
 export CONDA_ENV_PYTHON="${CONDA_ENV_PYTHON:-${HOME}/miniconda3/envs/${CONDA_ENV}/bin/python}"
+export WORKER_ENV_SOURCE="${WORKER_ENV_SOURCE:-${HOME}/miniconda3/etc/profile.d/conda.sh}"  # tmux pane 里 conda activate 前先 source 这个
 
 # 生成 RUN_ID
 export RUN_ID="${RUN_ID:-eval_$(date +%Y%m%d_%H%M%S)}"
@@ -149,6 +155,8 @@ export MAX_VIDEOS_PER_WORKER
 
 # backbone 相关路径参数（供 batch scheduler 传递）
 export MAGE_FLOW_MODEL_PATH="${MAGE_FLOW_MODEL_PATH:-}"
+export SHARED_ENCODER
+export VF_HF_ATTN_IMPL="${MAGE_ATTN_IMPL:-sdpa}"   # mage encoder attn: sdpa(默认, 无需 flash-attn) | flash_attention_2(需装 flash-attn)
 
 # 自动生成任务清单
 if [[ -z "${TASK_LIST}" ]]; then

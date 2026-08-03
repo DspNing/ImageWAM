@@ -134,6 +134,69 @@ run_libero_plus_batch() {
     fi
     tmux new-session -d -s "$SESSION_NAME" -n "w0"
 
+    # ---- (optional) per-GPU shared text-encoder servers ----
+    # When SHARED_ENCODER=true, start one encoder server per GPU before workers;
+    # workers then skip loading the 8.3GB encoder and fetch context from their
+    # GPU's server. Servers are killed after all workers finish (see shutdown below).
+    local -a ENC_PIDS=()
+    local -a ENC_SOCKS=()
+    if [[ "${SHARED_ENCODER:-false}" == "true" ]]; then
+        echo "[plus-batch] SHARED_ENCODER=true: starting per-GPU encoder servers..."
+        mkdir -p "$ROOT_DIR/.mage_enc"
+        local -A _enc_seen=()
+        local _gi
+        for _gi in "${GPU_ARRAY[@]}"; do
+            [[ -n "${_enc_seen[$_gi]:-}" ]] && continue
+            _enc_seen[$_gi]=1
+            local _sock="$ROOT_DIR/.mage_enc/mage_enc_gpu${_gi}.sock"
+            local _srvlog="$TASK_LOG_DIR/encoder_gpu${_gi}.log"
+            rm -f "$_sock"
+            CUDA_VISIBLE_DEVICES=$_gi PYTHONPATH="$ROOT_DIR/src" \
+                "${CONDA_ENV_PYTHON:-python}" "$ROOT_DIR/scripts/mage_flow/mage_encoder_server.py" \
+                --model-path "$MAGE_FLOW_MODEL_PATH" --socket "$_sock" > "$_srvlog" 2>&1 &
+            local _pid=$!
+            ENC_PIDS+=("$_pid")
+            ENC_SOCKS+=("$_sock")
+            echo "[plus-batch] encoder server GPU$_gi pid=$_pid sock=$_sock log=$_srvlog"
+        done
+        # Wait until each server's socket file exists (encoder loaded + bound) or it dies.
+        local _si
+        for _si in "${!ENC_SOCKS[@]}"; do
+            local _sock="${ENC_SOCKS[$_si]}"
+            local _pid="${ENC_PIDS[$_si]}"
+            local _srvlog="$TASK_LOG_DIR/encoder_gpu*.log"
+            local _ready=false
+            local _
+            for _ in $(seq 1 150); do  # up to ~5 min
+                if [[ -S "$_sock" ]]; then _ready=true; break; fi
+                if ! kill -0 "$_pid" 2>/dev/null; then
+                    echo "[plus-batch] ERROR: encoder server pid=$_pid died before ready. Log: $_srvlog" >&2
+                    for p in "${ENC_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+                    exit 1
+                fi
+                sleep 2
+            done
+            if [[ "$_ready" != "true" ]]; then
+                echo "[plus-batch] ERROR: encoder server $_sock not ready after timeout. Log: $_srvlog" >&2
+                for p in "${ENC_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+                exit 1
+            fi
+            echo "[plus-batch] encoder server $_sock ready"
+        done
+    fi
+
+    # ---- Trap: ensure encoder servers are killed on ANY exit (normal, Ctrl+C, tmux kill, etc.) ----
+    if [[ ${#ENC_PIDS[@]} -gt 0 ]]; then
+        trap '
+            for _tpid in "${ENC_PIDS[@]}"; do kill "$_tpid" 2>/dev/null; done
+            sleep 1
+            for _tpid in "${ENC_PIDS[@]}"; do kill -9 "$_tpid" 2>/dev/null; done
+            for _tsock in "${ENC_SOCKS[@]}"; do rm -f "$_tsock" 2>/dev/null; done
+            rm -rf "$ROOT_DIR/.mage_enc" 2>/dev/null
+            echo "[plus-batch] encoder servers cleaned up via trap" >&2
+        ' EXIT INT TERM
+    fi
+
     # ---- Launch one long-lived worker per window/pane ----
     echo "[plus-batch] Launching $NUM_WORKERS workers..."
     for wid in "${!chunk_files[@]}"; do
@@ -155,6 +218,16 @@ run_libero_plus_batch() {
 
         CONDA_ENV="${CONDA_ENV:-mageflow}"
         WORKER_THREADS="${WORKER_THREADS:-3}"
+
+        # Shared-encoder mode: point this worker at its GPU's encoder server and
+        # skip loading the text encoder locally. load_text_encoder=false is appended
+        # AFTER $EXTRA_ARGS so it overrides the mage_flow default (true).
+        local _shared_export=""
+        local _shared_override=""
+        if [[ "${SHARED_ENCODER:-false}" == "true" ]]; then
+            _shared_export="export MAGE_ENCODER_SOCKET=$ROOT_DIR/.mage_enc/mage_enc_gpu${real_gpu_id}.sock && "
+            _shared_override="model.load_text_encoder=false"
+        fi
 
         # Build the worker command — activate conda env, then launch eval_libero_batch.py
         local model_paths=""
@@ -180,7 +253,7 @@ run_libero_plus_batch() {
             export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
                 OMP_NUM_THREADS=$WORKER_THREADS MKL_NUM_THREADS=$WORKER_THREADS \
                 PYTHONPATH=${LIBERO_PKG_DIR}:${REPO_ROOT}/src && \
-            CUDA_VISIBLE_DEVICES=$real_gpu_id python experiments/libero/eval_libero_batch.py \
+            ${_shared_export}CUDA_VISIBLE_DEVICES=$real_gpu_id python experiments/libero/eval_libero_batch.py \
                 task=$CONFIG ckpt=$CKPT \
                 EVALUATION.num_trials=$NUM_TRIALS \
                 EVALUATION.output_dir=$OUTPUT_DIR \
@@ -194,7 +267,7 @@ run_libero_plus_batch() {
                 ${TEXT_CACHE_DIR:+EVALUATION.text_cache_dir=$TEXT_CACHE_DIR} \
                 ${TEXT_CACHE_DIR:+model.load_text_encoder=false} \
                 $model_paths \
-                gpu_id=$real_gpu_id $EXTRA_ARGS > '${log_file}' 2>&1; \
+                gpu_id=$real_gpu_id $EXTRA_ARGS ${_shared_override}> '${log_file}' 2>&1; \
             echo '[worker $wid] exited rc=\$?'"
 
         tmux send-keys -t "$SESSION_NAME:$pane_info" "$launch_cmd" C-m 2>/dev/null
@@ -245,6 +318,18 @@ run_libero_plus_batch() {
 
         sleep $monitoring_interval
     done
+
+    # ---- Stop shared encoder servers (if any) ----
+    if [[ ${#ENC_PIDS[@]} -gt 0 ]]; then
+        echo "[plus-batch] stopping ${#ENC_PIDS[@]} encoder server(s)..."
+        local _pid
+        for _pid in "${ENC_PIDS[@]}"; do kill "$_pid" 2>/dev/null; done
+        sleep 2
+        for _pid in "${ENC_PIDS[@]}"; do kill -9 "$_pid" 2>/dev/null; done
+        local _sock
+        for _sock in "${ENC_SOCKS[@]}"; do rm -f "$_sock"; done
+        rm -rf "$ROOT_DIR/.mage_enc" 2>/dev/null || true
+    fi
 
     # ---- Summarize ----
     echo "[plus-batch] Generating evaluation report..."

@@ -629,8 +629,23 @@ def _predict_action_chunk(
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
 
-    # Use precomputed text embeddings if available (saves VRAM by skipping text encoder)
-    if text_cache is not None:
+    # Shared per-GPU encoder server mode: when MAGE_ENCODER_SOCKET is set, fetch
+    # the text context from this GPU's encoder server instead of loading the text
+    # encoder in every worker. The server runs the identical encode_edit_conditions
+    # (same image denorm + PIL + call), so the context is bit-identical to local
+    # online encoding -> zero accuracy change.
+    import time as _time
+    _mage_enc_sock = os.environ.get("MAGE_ENCODER_SOCKET")
+    _t_enc = 0.0
+    if _mage_enc_sock:
+        from mage_encoder_client import encode_context
+        _t0 = _time.time()
+        _ctx, _msk = encode_context(_mage_enc_sock, prompt, image)
+        _t_enc = _time.time() - _t0
+        infer_kwargs["context"] = _ctx.to(model_device, dtype=model.torch_dtype)
+        infer_kwargs["context_mask"] = _msk.to(model_device)
+    elif text_cache is not None:
+        # Use precomputed text embeddings if available (saves VRAM by skipping text encoder)
         cached = _get_cached_context(prompt, text_cache, model_device, model.torch_dtype)
         if cached is not None:
             context, context_mask = cached
@@ -652,6 +667,7 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = 2 if endpoint_frames_only else _get_num_video_frames(cfg)
 
     with torch.no_grad():
+        _t1 = _time.time()
         if visualize_future_video:
             pred = model.infer_joint(**infer_kwargs)
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
@@ -671,6 +687,16 @@ def _predict_action_chunk(
                 )
         else:
             pred = model.infer_action(**infer_kwargs)
+        _t_infer = _time.time() - _t1
+        # Log timing breakdown every 50 steps to avoid spam
+        _step_counter = getattr(_predict_action_chunk, "_step_counter", 0) + 1
+        _predict_action_chunk._step_counter = _step_counter
+        _replan = int(cfg.EVALUATION.get("replan_steps", "?"))
+        if _step_counter % 50 == 1:
+            logging.info(
+                f"[timing] replan_steps={_replan}  encoder_rpc={1000*_t_enc:.0f}ms  "
+                f"model_infer={1000*_t_infer:.0f}ms  total={1000*(_t_enc+_t_infer):.0f}ms"
+            )
             # infer_kwargs["num_video_frames"] = 2 if endpoint_frames_only else _get_num_video_frames(cfg)
             # pred = model.infer_joint(**infer_kwargs)
 
