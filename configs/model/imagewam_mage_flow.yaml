@@ -1,17 +1,27 @@
 _target_: imagewam.runtime.create_imagewam_mage_flow
 
-mage_flow_model_path: microsoft/Mage-Flow-Edit-Turbo
+mage_flow_model_path: microsoft/Mage-Flow-Edit-Base
 mage_flow_src_path: ${oc.env:IMAGEWAM_MAGE_FLOW_SRC_PATH,third_party/Mage}
 proprio_dim: null
 load_text_encoder: false
 mot_checkpoint_mixed_attn: false
 
-# torch.compile the MoT DiT forward for higher throughput. Applied inside the
-# model builder before accelerate/DeepSpeed wraps the module, so it stays on the
-# critical path of training. Leave false until you've validated a run.
-compile_dit: true
-compile_mode: default      # use "default" with ZeRO; avoid "reduce-overhead" (cudagraphs)
-compile_dynamic: true      # guard the variable packed text length against recompiles
+# Per-segment timestep modulation: modulate the reference/text stream with a
+# constant t=0 temb while only the target keeps the live video timestep. This
+# makes the frozen single-sigma reference KV cache (deployment fast path,
+# prefill run at t=0) train/test-consistent and fixes the action-only vs joint
+# divergence. Needs finetuning — the base model was trained with a single shared
+# temb. See src/imagewam/models/backbones/mage_flow_video_block_per_segment.py.
+per_segment_temb: true
+
+# ReWorld-style future-predictive intermediate supervision (Stage 1): a
+# lightweight auxiliary head on the l-th Video DiT block regresses the same
+# rectified-flow velocity target, accelerating from-scratch convergence and
+# shaping the world representation earlier. Mage-Flow-Edit-Base-2B has depth=6
+# (Base has depth=12); index 2 ~= depth//3 of the 2B and is valid for both.
+# Must be < the loaded model's depth. Set to null to disable.
+# See [[reworld-mid-loss]].
+mid_layer_index: null
 
 action_dit_config:
   action_dim: ${data.train.processor.action_output_dim}
@@ -32,3 +42,4 @@ action_scheduler:
 loss:
   lambda_video: 0.5
   lambda_action: 1.0
+  lambda_mid: 0.0  # ReWorld disabled (mid_layer_index=null); 0 disables

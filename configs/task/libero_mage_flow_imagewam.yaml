@@ -30,8 +30,8 @@ num_epochs: 10
 max_steps: null
 log_every: 10
 save_every: 2000
-eval_every: 500
-eval_num_samples: 2
+eval_every: 1000
+eval_num_samples: 10
 keep_latest_state_only: true
 
 gradient_accumulation_steps: 1

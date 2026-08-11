@@ -44,7 +44,7 @@ run_libero_plus_batch() {
     export OUTPUT_DIR
     EXP_NAME=${EXP_NAME:-""}
     export EXP_NAME
-    SESSION_NAME="libero_plus_batch"
+    SESSION_NAME="${TMUX_SESSION_NAME:-libero_plus_batch_${RUN_ID}}"
 
     echo "[plus-batch] EXP_NAME: $EXP_NAME"
     mkdir -p "$OUTPUT_DIR"
@@ -185,18 +185,6 @@ run_libero_plus_batch() {
         done
     fi
 
-    # ---- Trap: ensure encoder servers are killed on ANY exit (normal, Ctrl+C, tmux kill, etc.) ----
-    if [[ ${#ENC_PIDS[@]} -gt 0 ]]; then
-        trap '
-            for _tpid in "${ENC_PIDS[@]}"; do kill "$_tpid" 2>/dev/null; done
-            sleep 1
-            for _tpid in "${ENC_PIDS[@]}"; do kill -9 "$_tpid" 2>/dev/null; done
-            for _tsock in "${ENC_SOCKS[@]}"; do rm -f "$_tsock" 2>/dev/null; done
-            rm -rf "$ROOT_DIR/.mage_enc" 2>/dev/null
-            echo "[plus-batch] encoder servers cleaned up via trap" >&2
-        ' EXIT INT TERM
-    fi
-
     # ---- Launch one long-lived worker per window/pane ----
     echo "[plus-batch] Launching $NUM_WORKERS workers..."
     for wid in "${!chunk_files[@]}"; do
@@ -252,7 +240,8 @@ run_libero_plus_batch() {
             conda activate $CONDA_ENV && \
             export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
                 OMP_NUM_THREADS=$WORKER_THREADS MKL_NUM_THREADS=$WORKER_THREADS \
-                PYTHONPATH=${LIBERO_PKG_DIR}:${REPO_ROOT}/src && \
+                PYTHONPATH=${LIBERO_PKG_DIR}:${REPO_ROOT}/src \
+                IMAGE_SIZE=${IMAGE_SIZE:-224} && \
             ${_shared_export}CUDA_VISIBLE_DEVICES=$real_gpu_id python experiments/libero/eval_libero_batch.py \
                 task=$CONFIG ckpt=$CKPT \
                 EVALUATION.num_trials=$NUM_TRIALS \

@@ -55,6 +55,11 @@ from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+# Register custom resolvers (e.g. ${envint:IMAGE_SIZE,224}, ${eval:...}) so the
+# data config's image-size interpolations resolve before OmegaConf.resolve().
+from imagewam.utils.config_resolvers import register_default_resolvers
+register_default_resolvers()
+
 
 def build_dataset(task: str, pretrained_norm_stats: str = None, dataset_dirs: str = None):
     """Build dataset without caches to get raw video frames."""
@@ -79,6 +84,7 @@ def build_dataset(task: str, pretrained_norm_stats: str = None, dataset_dirs: st
     cfg.data.train.video_augmentation = None
     cfg.data.train.condition_frame_augmentation = None
     cfg.data.train.qwen_text_cache_dir = None  # Disable qwen cache for precompute
+    cfg.data.train.mage_text_cache_dir = None  # Disable mage text cache for precompute
 
     ds = instantiate(cfg.data.train)
 

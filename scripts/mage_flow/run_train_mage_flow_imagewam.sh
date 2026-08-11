@@ -74,7 +74,21 @@ COMMON_OVERRIDES=(
   "model.action_dit_config.pretrained_path=${ACTION_INIT}"
 )
 
-TASK="${TASK_NAME}" imagewam_run bash scripts/train_zero1.sh "${GPU_PER_NODE}" \
+SCRIPT_DIR_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+case "${ZERO_STAGE}" in
+  1|zero1)
+    TRAIN_LAUNCH_SCRIPT="${SCRIPT_DIR_ROOT}/train_zero1.sh"
+    ;;
+  2|zero2)
+    TRAIN_LAUNCH_SCRIPT="${SCRIPT_DIR_ROOT}/train_zero2.sh"
+    ;;
+  *)
+    echo "Invalid ZERO_STAGE=${ZERO_STAGE}; expected 1, zero1, 2, or zero2" >&2
+    exit 1
+    ;;
+esac
+
+TASK="${TASK_NAME}" imagewam_run bash "${TRAIN_LAUNCH_SCRIPT}" "${GPU_PER_NODE}" \
   task="${TASK_NAME}" \
   "${DATASET_OVERRIDES[@]}" \
   "${COMMON_OVERRIDES[@]}" \

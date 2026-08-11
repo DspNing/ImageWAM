@@ -13,7 +13,8 @@ class MageFlowVideoExpert(nn.Module):
 
     block_protocol = "mage_flow"
 
-    def __init__(self, model: nn.Module, model_path: str, load_text_encoder: bool = True):
+    def __init__(self, model: nn.Module, model_path: str, load_text_encoder: bool = True,
+                 per_segment_temb: bool = False, mid_layer_index: int | None = None):
         super().__init__()
         self.model = model
         self.transformer = getattr(model, "transformer", None)
@@ -32,6 +33,43 @@ class MageFlowVideoExpert(nn.Module):
         self.vae_downsample_rate = 16
         self.caption_dim = int(self.transformer.txt_in.in_features) if self.transformer is not None else 0
         self.load_text_encoder = bool(load_text_encoder)
+        # When enabled, reclass the vendored video blocks in place to a thin
+        # subclass that modulates the reference/text stream with a constant t=0
+        # temb (only the target slice uses the live tv temb). Parameters and
+        # state-dict keys are unchanged; see
+        # ``mage_flow_video_block_per_segment`` for the rationale.
+        self.per_segment_temb = bool(per_segment_temb)
+        if self.per_segment_temb and self.transformer is not None:
+            from .mage_flow_video_block_per_segment import make_per_segment_video_block_class
+            base_cls = type(self.transformer.transformer_blocks[0])
+            sub_cls = make_per_segment_video_block_class(base_cls)
+            for block in self.transformer.transformer_blocks:
+                block.__class__ = sub_cls
+
+        # ReWorld-style future-predictive intermediate supervision (Stage 1):
+        # a lightweight auxiliary head on the output of the l-th video block that
+        # regresses the same rectified-flow velocity target as the main head.
+        # `mid_layer_index=None` disables it (no extra params, no overhead).
+        # See [[reworld-mid-loss]] / ReWorld §3.3 Eq.(6)-(8).
+        self.mid_layer_index = None
+        if mid_layer_index is not None and self.transformer is not None:
+            depth = self.double_layers
+            idx = int(mid_layer_index)
+            if not (0 <= idx < depth):
+                raise ValueError(
+                    f"mid_layer_index {idx} is out of range [0, {depth}) for this "
+                    f"{depth}-layer Video DiT; pick roughly depth // 3.")
+            self.mid_layer_index = idx
+            from mage_flow.models.modules.mage_layers import AdaLayerNormContinuous
+            inner_dim = int(self.transformer.inner_dim)
+            patch = int(self.transformer.patch_size)
+            out_ch = int(self.transformer.out_channels)
+            # Mirror the main output head (norm_out + proj_out) so the auxiliary
+            # target lives in the same modulation/parameterization as the final
+            # velocity prediction.
+            self.mid_norm = AdaLayerNormContinuous(
+                inner_dim, inner_dim, elementwise_affine=False, eps=1e-6)
+            self.mid_proj = nn.Linear(inner_dim, patch * patch * out_ch, bias=True)
 
     def compute_vae_encodings(self, pixel_values, with_ids: bool = True):
         return self.model.compute_vae_encodings(pixel_values, with_ids=with_ids)
@@ -80,7 +118,8 @@ class MageFlowVideoExpert(nn.Module):
     @classmethod
     def from_pretrained(cls, model_path: str, mage_flow_src_path: str | None = None,
                         device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16,
-                        load_text_encoder: bool = True, text_encoder_only: bool = False):
+                        load_text_encoder: bool = True, text_encoder_only: bool = False,
+                        per_segment_temb: bool = False, mid_layer_index: int | None = None):
         ensure_mage_flow_importable(mage_flow_src_path)
         from mage_flow.pipeline import load_from_repo
 
@@ -98,7 +137,8 @@ class MageFlowVideoExpert(nn.Module):
             if model.vae is not None:
                 model.vae.to(device=device, dtype=torch_dtype)
             model.eval()
-        return cls(model, model_path, load_text_encoder=load_text_encoder)
+        return cls(model, model_path, load_text_encoder=load_text_encoder,
+                   per_segment_temb=per_segment_temb, mid_layer_index=mid_layer_index)
 
     def encode_image_latents(self, image: torch.Tensor) -> torch.Tensor:
         return self.vae.encode(image.to(device=self.device, dtype=self.torch_dtype))
@@ -143,6 +183,10 @@ class MageFlowVideoExpert(nn.Module):
             packed_context = torch.cat(txt_rows, dim=0)
             txt = transformer.txt_in(transformer.txt_norm(packed_context.unsqueeze(0)))
         temb = transformer.time_text_embed(timestep.to(img.dtype), img)
+        if self.per_segment_temb:
+            temb_zero = transformer.time_text_embed(
+                torch.zeros_like(timestep).to(img.dtype), img)
+            temb = (temb, temb_zero, int(target_len))
         rope_shapes = img_shapes
         rope_skip = 0
         if img_shapes and img_shapes[0] and int(img_shapes[0][0][0]) == 0:

@@ -78,15 +78,9 @@ from imagewam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_j
 from imagewam.utils.pytorch_utils import set_global_seed  # noqa: E402
 from libero.libero import benchmark  # noqa: E402
 
-# The custom resolvers (eval/max/split) are already registered by
-# ``eval_libero_single`` (imported above), which is always imported before this
-# point. Re-registering would raise, so we register defensively only if a
-# resolver is somehow missing.
-for _name, _fn in (("eval", eval), ("max", lambda x: max(x)), ("split", lambda s, idx: s.split("/")[int(idx)])):
-    try:
-        OmegaConf.register_new_resolver(_name, _fn)
-    except ValueError:
-        pass
+from imagewam.utils.config_resolvers import register_default_resolvers
+
+register_default_resolvers()
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 

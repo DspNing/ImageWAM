@@ -19,28 +19,29 @@ MAGE_FLOW_VARIANT="${MAGE_FLOW_VARIANT:-base}"
 
 #   plus : 传入任务清单文件路径（或由调度脚本自动生成）
 #   master: 传入任务清单文件路径
-# TASK_LIST="./task_lists/libero_plus_all.txt"                                      # 全量 libero-plus
-TASK_LIST="./task_lists/libero_plus_robot_initial_states.txt"                       # 仅 robot 扰动子集
+TASK_LIST="./task_lists/libero_plus_all.txt"                                      # 留空 = 自动生成任务列表
 
 # checkpoint 路径（必填）：
 # CKPT="./checkpoints/imagewam_release/libero/flux2_klein_4b/model.pt"
-CKPT="/data/NingZijian/ImageWAM/runs/libero_mage_flow_imagewam/mageflow-4b-112*224/checkpoints/weights/step_042000.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
+CKPT="./runs/libero_mage_flow_imagewam/2026-08-10_08-19-01/checkpoints/weights/step_043400.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
 
 # dataset_stats 路径（留空 = 自动从 ckpt 父目录查找）：
 STATS="./data/dataset_stats.json"
 
 NUM_TRIALS=""                                      # 留空：plus→1 / master→25；填数字则强制覆盖
 NUM_INFERENCE_STEPS="10"                             # 每次动作预测的去噪步数
-REPLAN_STEPS="5"                                    # replan 间隔（每 N 步重新观测+推理）; 留空=用 batch 脚本默认 12
+
+# 推理图像分辨率（必须与训练一致）：112 | 224
+IMAGE_SIZE="112"
 
 # —— 视频控制 ——
-SAVE_VIDEO="true"                                #  是否保存 rollout 视频
-MAX_VIDEOS_PER_WORKER="50"                         #  plus 模式：每个 worker 最多保存多少个 task 的视频
-VISUALIZE_FUTURE_VIDEO="true"                    #  是否infer joint
+SAVE_VIDEO="false"                                #  是否保存 rollout 视频
+MAX_VIDEOS_PER_WORKER="5"                         #  plus 模式：每个 worker 最多保存多少个 task 的视频
+VISUALIZE_FUTURE_VIDEO="false"                    #  是否可视化未来动作视频
 
 # —— 以下一般不用改 ——
 CONFIG="libero_mage_flow_imagewam"      # configs/task/ 下的配置名（不带 .yaml）
-MAX_TASKS_PER_GPU=2                              # 每卡并发任务数
+MAX_TASKS_PER_GPU=7                               # 每卡并发任务数
 
 # 用哪个 conda env 跑 worker。
 CONDA_ENV="mageflow"
@@ -117,20 +118,23 @@ if [[ -n "${TASK_LIST}" ]]; then
     [[ -f "${TASK_LIST}" ]] || { echo "Error: TASK_LIST 不存在: ${TASK_LIST}" >&2; exit 1; }
 fi
 [[ -f "${CKPT}" ]] || { echo "Error: CKPT 不存在: ${CKPT}" >&2; exit 1; }
+case "${IMAGE_SIZE}" in
+    112|224) : ;;
+    *) echo "Error: IMAGE_SIZE 必须是 112 或 224，当前: '${IMAGE_SIZE}'" >&2; exit 1 ;;
+esac
 if [[ -n "${STATS}" ]]; then
     [[ -f "${STATS}" ]] || { echo "Error: STATS 不存在: ${STATS}" >&2; exit 1; }
 fi
 
 export CONFIG
+export IMAGE_SIZE
 export CUDA_VISIBLE_DEVICES="${GPUS}"
 export MAX_TASKS_PER_GPU
 export NUM_TRIALS
-export REPLAN_STEPS
 export CKPT
 export RESULTS_SUBDIR
 export CONDA_ENV
 export CONDA_ENV_PYTHON="${CONDA_ENV_PYTHON:-${HOME}/miniconda3/envs/${CONDA_ENV}/bin/python}"
-export WORKER_ENV_SOURCE="${WORKER_ENV_SOURCE:-${HOME}/miniconda3/etc/profile.d/conda.sh}"  # tmux pane 里 conda activate 前先 source 这个
 
 # 生成 RUN_ID
 export RUN_ID="${RUN_ID:-eval_$(date +%Y%m%d_%H%M%S)}"
@@ -193,6 +197,7 @@ echo "  TASK_LIST     : ${TASK_LIST} ($(wc -l < "${TASK_LIST}") 任务)"
 echo "  NUM_TRIALS    : ${NUM_TRIALS}"
 echo "  MAX_TASKS_PER_GPU: ${MAX_TASKS_PER_GPU}"
 echo "  CKPT          : ${CKPT}"
+echo "  IMAGE_SIZE    : ${IMAGE_SIZE}"
 echo "  STATS         : ${STATS:-<auto-find>}"
 echo "  CONFIG        : ${CONFIG}"
 echo "  CONDA_ENV     : ${CONDA_ENV:-<默认>}"

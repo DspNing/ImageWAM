@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from typing import Dict, Optional
 
@@ -12,6 +13,111 @@ from .ovis_u1_imports import ensure_ovis_u1_remote_code_importable
 from imagewam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# flex_attention path for MageFlow packed mixed attention.
+#
+# The dense `[1, L, L]` bool mask built by `_build_mot_attention_mask_*` is
+# ~96% zeros (only intra-sample text/target/reference/action blocks are True).
+# SDPA rejects it for the flash backend (arbitrary bool mask) and falls back to
+# the memory-efficient backend, which still computes the *full* O(L^2) attention
+# and masks the output — wasting ~27x the work and dominating backward time.
+#
+# `flex_attention` + `BlockMask` skips the all-zero blocks entirely, computing
+# only the ~3.7% nonzero block pairs. Exactness at non-block-aligned token
+# boundaries (variable text length, target/ref/action spans) is guaranteed by a
+# `score_mod` that re-applies the identical per-position rule used by the dense
+# mask builder, so the flex path is numerically equivalent to the SDPA path.
+#
+# Token block types (per-sample packed order): 0=text, 1=target, 2=reference,
+# 3=action. The visibility rule (target read only by itself; reference/action
+# never read target; target/action mutually isolated) is encoded directly in
+# `_flex_attention_call`'s score_mod via the is_target/is_action flags.
+# ---------------------------------------------------------------------------
+def _build_mage_flow_token_maps(
+    text_cu_lens: torch.Tensor,
+    image_cu_lens: torch.Tensor,
+    action_cu_lens: torch.Tensor,
+    target_len: int,
+    text_total: int,
+    image_total: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token (sample_id, block_type) for the global [text|image|action] pack.
+
+    Mirrors the geometry of `_build_mot_attention_mask_mage_flow_packed` so the
+    flex score_mod reproduces the exact same mask. `target_len` is the per-sample
+    target-image token count (reference follows it in the image span).
+    """
+    text_cu_lens = text_cu_lens.to(device=device, dtype=torch.long)
+    image_cu_lens = image_cu_lens.to(device=device, dtype=torch.long)
+    action_cu_lens = action_cu_lens.to(device=device, dtype=torch.long)
+    batch_size = int(text_cu_lens.numel() - 1)
+    action_total = int(action_cu_lens[-1])
+    total = text_total + image_total + action_total
+    sample_id = torch.empty(total, dtype=torch.long, device=device)
+    block_type = torch.empty(total, dtype=torch.long, device=device)
+    image_base = text_total
+    action_base = text_total + image_total
+    for s in range(batch_size):
+        t0, t1 = int(text_cu_lens[s]), int(text_cu_lens[s + 1])
+        i0 = image_base + int(image_cu_lens[s])
+        i1 = image_base + int(image_cu_lens[s + 1])
+        a0 = action_base + int(action_cu_lens[s])
+        a1 = action_base + int(action_cu_lens[s + 1])
+        target_end = i0 + target_len
+        if target_end > i1:
+            raise ValueError(
+                f"target_len={target_len} exceeds image span "
+                f"[{i0 - image_base}, {i1 - image_base}) for sample {s}"
+            )
+        sample_id[t0:t1] = s
+        block_type[t0:t1] = 0  # text
+        sample_id[i0:target_end] = s
+        block_type[i0:target_end] = 1  # target
+        sample_id[target_end:i1] = s
+        block_type[target_end:i1] = 2  # reference
+        sample_id[a0:a1] = s
+        block_type[a0:a1] = 3  # action
+    return sample_id, block_type
+
+
+def _flex_attention_call(q, k, v, block_mask, sample_id, is_target, is_action):
+    """Compiled body for block-sparse MageFlow mixed attention.
+
+    `score_mod` is defined *inside* the compiled region and closes over the
+    tensor ARGS, so torch.compile sees one stable graph; the per-forward tensors
+    are dynamic-shape inputs (variable packed L), not captured constants.
+
+    Exactness: `block_mask` (built from `sample_id[q]==sample_id[k]`) isolates
+    samples; `score_mod` then removes the intra-sample holes by forbidding any
+    query from reading target/action tokens unless it is itself target/action.
+    This reproduces every cell of the 4x4 visibility matrix used by the dense
+    mask builder, without 2D advanced indexing (which crashes the flex backward
+    Triton kernel in torch 2.7.x).
+    """
+    from torch.nn.attention.flex_attention import flex_attention
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        # cross-sample is already handled by the block_mask; here we only carve
+        # out the within-sample holes.
+        score = score.masked_fill(is_target[kv_idx] & ~is_target[q_idx], float("-inf"))
+        score = score.masked_fill(is_action[kv_idx] & ~is_action[q_idx], float("-inf"))
+        return score
+
+    return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
+
+
+_FLEX_ATTENTION_COMPILED = None
+
+
+def _get_flex_attention_compiled():
+    """Lazily torch.compile the flex body once (dynamic shapes)."""
+    global _FLEX_ATTENTION_COMPILED
+    if _FLEX_ATTENTION_COMPILED is None:
+        _FLEX_ATTENTION_COMPILED = torch.compile(_flex_attention_call, dynamic=True)
+    return _FLEX_ATTENTION_COMPILED
 
 
 class MoT(nn.Module):
@@ -37,6 +143,22 @@ class MoT(nn.Module):
         self.force_flash_attention = bool(force_flash_attention)
         if mot_checkpoint_mixed_attn:
             logger.info("Using gradient checkpointing for mixture attention.")
+
+        # MageFlow packed mixed-attention backend. "sdpa" (default) builds the
+        # dense `[1, L, L]` bool mask and runs SDPA (flash rejects the mask, so
+        # it falls back to the memory-efficient backend at full O(L^2) cost).
+        # "flex" uses `flex_attention` + BlockMask to skip the ~96% all-zero
+        # block pairs, computing only the nonzero intra-sample blocks. Set via
+        # `MAGEFLOW_MIXED_ATTN=flex`. See `_forward_mage_flow`.
+        # NOTE: flex REQUIRES torch.compile (eager flex_attention is ~9x slower
+        # than dense SDPA). The compiled body (`_flex_attention_call`) keeps
+        # score_mod inside the graph and takes the per-forward token maps as
+        # dynamic-shape tensor args, so one graph is reused across steps.
+        self.mage_flow_attn_backend = os.environ.get("MAGEFLOW_MIXED_ATTN", "sdpa").strip().lower()
+        if self.mage_flow_attn_backend not in {"sdpa", "flex"}:
+            raise ValueError(
+                f"MAGEFLOW_MIXED_ATTN must be 'sdpa' or 'flex', got {self.mage_flow_attn_backend!r}."
+            )
 
         first_expert = self.mixtures[self.expert_order[0]]
         self.num_layers = len(first_expert.blocks)
@@ -182,6 +304,36 @@ class MoT(nn.Module):
         if self.mot_checkpoint_mixed_attn and self.training:
             return torch.utils.checkpoint.checkpoint(_forward, q_cat, k_cat, v_cat, use_reentrant=False)
         return _forward(q_cat, k_cat, v_cat)
+
+    def _flex_mixed_attention(
+        self,
+        q_cat: torch.Tensor,
+        k_cat: torch.Tensor,
+        v_cat: torch.Tensor,
+        block_mask,
+        sample_id: torch.Tensor,
+        is_target: torch.Tensor,
+        is_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Block-sparse mixed attention via compiled `flex_attention`.
+
+        `block_mask` (sample-gated, built once per forward) skips the all-zero
+        cross-sample block pairs; the in-graph `score_mod` carves the
+        within-sample holes so the result is numerically identical to
+        `_mixed_attention(..., full_mask)`. MageFlow has no GQA
+        (num_kv_heads == num_heads), so q/k/v share head geometry.
+        """
+        if self.num_kv_heads != self.num_heads:
+            raise ValueError("flex mixed attention currently requires num_kv_heads == num_heads.")
+        H, D = self.num_heads, self.attn_head_dim
+        query_len = q_cat.shape[1]
+        q = q_cat.view(1, query_len, H, D).transpose(1, 2)
+        k = k_cat.view(1, k_cat.shape[1], H, D).transpose(1, 2)
+        v = v_cat.view(1, v_cat.shape[1], H, D).transpose(1, 2)
+        out = _get_flex_attention_compiled()(
+            q, k, v, block_mask, sample_id, is_target, is_action
+        )
+        return out.transpose(1, 2).reshape(1, query_len, H * D)
 
     def _build_io_wan22(self, expert, block, x: torch.Tensor, freqs: torch.Tensor, t_mod: torch.Tensor) -> dict:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_modulation(block, t_mod)
@@ -1247,34 +1399,83 @@ class MoT(nn.Module):
         atemb, arope = action_state["temb"], action_state["rope"]
         acu = action_state["cu_lens"]
         full_mask = context_all.get("mot_attention_mask")
-        if full_mask is None:
-            raise ValueError("Mage-Flow MoT requires a full packed mixed attention mask")
-        if full_mask.ndim == 3 and full_mask.shape[0] != 1:
-            raise ValueError(
-                "Mage-Flow packed mixed attention currently requires a single packed mask; "
-                f"got {tuple(full_mask.shape)}"
-            )
         # The mixed sequence is packed as [text | video image | action].
         # `video` contains image tokens only; the packed text stream is kept
         # separately in `text` and must be included in the mask geometry.
         total_len = int(text.shape[1] + video.shape[1] + action.shape[1])
-        if full_mask.shape[-2:] != (total_len, total_len):
-            raise ValueError(
-                "Mage-Flow packed mixed attention mask does not match joint streams: "
-                f"got {tuple(full_mask.shape)}, expected trailing shape {(total_len, total_len)}"
-            )
 
-        for vblock, ablock in zip(vtr.transformer_blocks, action_expert.blocks):
+        # ---- Backend selection for the packed mixed attention. ----
+        # sdpa: materialise the dense `[1, L, L]` bool mask (caller-built) and
+        #   run SDPA (falls back to the memory-efficient backend at full O(L^2)).
+        # flex: build a BlockMask + exact score_mod from the per-sample cu_lens
+        #   and skip the ~96% all-zero block pairs. No dense mask needed.
+        flex_block_mask = flex_sample_id = flex_is_target = flex_is_action = None
+        if self.mage_flow_attn_backend == "flex":
+            sample_id, block_type = _build_mage_flow_token_maps(
+                tcu, vcu, acu,
+                target_len=int(video_state["target_len"]),
+                text_total=int(text.shape[1]),
+                image_total=int(video.shape[1]),
+                device=video.device,
+            )
+            flex_sample_id = sample_id
+            flex_is_target = block_type == 1
+            flex_is_action = block_type == 3
+            try:
+                from torch.nn.attention.flex_attention import create_block_mask
+            except ImportError as exc:  # pragma: no cover - depends on torch build
+                raise RuntimeError(
+                    "MAGEFLOW_MIXED_ATTN=flex requires torch.nn.attention.flex_attention "
+                    "(torch >= 2.5)."
+                ) from exc
+            # BlockMask is pure cross-sample isolation (sample_id[q]==sample_id[k]);
+            # the within-sample 4x4 holes are applied by score_mod inside the
+            # compiled flex body. Built once per forward, reused across all layers.
+            _sid = sample_id
+
+            def _mask_mod(b, h, q_idx, kv_idx):
+                return _sid[q_idx] == _sid[kv_idx]
+
+            flex_block_mask = create_block_mask(
+                _mask_mod, B=1, H=1, Q_LEN=total_len, KV_LEN=total_len, device=video.device,
+            )
+        else:
+            if full_mask is None:
+                raise ValueError("Mage-Flow MoT requires a full packed mixed attention mask")
+            if full_mask.ndim == 3 and full_mask.shape[0] != 1:
+                raise ValueError(
+                    "Mage-Flow packed mixed attention currently requires a single packed mask; "
+                    f"got {tuple(full_mask.shape)}"
+                )
+            if full_mask.shape[-2:] != (total_len, total_len):
+                raise ValueError(
+                    "Mage-Flow packed mixed attention mask does not match joint streams: "
+                    f"got {tuple(full_mask.shape)}, expected trailing shape {(total_len, total_len)}"
+                )
+
+        # The mid head is a training-only auxiliary (ReWorld Stage 1); its output
+        # is unused at inference. Gate it on self.training so eval/inference
+        # (model.eval(), @torch.no_grad) never builds or runs it — keeps eval
+        # bit-identical and avoids a float32-head vs bf16-activation mismatch
+        # that only autocast (present in training) would paper over.
+        mid_enabled = self.training and video_expert.mid_layer_index is not None
+        mid_layer_index = video_expert.mid_layer_index
+        mid_hidden = None
+        for idx, (vblock, ablock) in enumerate(zip(vtr.transformer_blocks, action_expert.blocks)):
             def layer_fn(video_in, text_in, action_in):
                 v_state = vblock.prepare_qkv(
                     video_in, text_in, vtemb, vrope, tcu, vcu)
                 a_state = ablock.prepare_qkv(
-                    action_in, video_in, atemb, arope, acu 
+                    action_in, video_in, atemb, arope, acu
                 )
                 q = torch.cat((v_state["q"], a_state["q"]), dim=1)
                 k = torch.cat((v_state["k"], a_state["k"]), dim=1)
                 value = torch.cat((v_state["v"], a_state["v"]), dim=1)
-                mixed = self._mixed_attention(q, k, value, full_mask)
+                if flex_block_mask is not None:
+                    mixed = self._flex_mixed_attention(
+                        q, k, value, flex_block_mask, flex_sample_id, flex_is_target, flex_is_action)
+                else:
+                    mixed = self._mixed_attention(q, k, value, full_mask)
                 v_len = v_state["text_len"] + v_state["image_len"]
                 video_mixed, action_mixed = torch.split(
                     mixed, [v_len, a_state["q"].shape[1]], dim=1)
@@ -1286,10 +1487,21 @@ class MoT(nn.Module):
                     layer_fn, video, text, action, use_reentrant=False)
             else:
                 video, text, action = layer_fn(video, text, action)
+            if mid_enabled and idx == mid_layer_index:
+                mid_hidden = video
 
-        video = vtr.norm_out(video, vtemb, cu_seqlens=vcu)
+        norm_temb = vtemb[0] if isinstance(vtemb, tuple) else vtemb
+        video = vtr.norm_out(video, norm_temb, cu_seqlens=vcu)
         video = vtr.proj_out(video).reshape(
             int(video_state["batch_size"]), -1, vtr.out_channels)
         action = action_expert.final_norm(action).reshape(
             int(action_state["batch_size"]), -1, action_expert.hidden_dim)
-        return {"video": video, "action": action}
+        out = {"video": video, "action": action}
+        if mid_hidden is not None:
+            # Auxiliary velocity prediction from the l-th video block (ReWorld
+            # Eq.6). Same norm+proj parameterization and reshape as the main head.
+            mid = video_expert.mid_norm(mid_hidden, norm_temb, cu_seqlens=vcu)
+            mid = video_expert.mid_proj(mid).reshape(
+                int(video_state["batch_size"]), -1, vtr.out_channels)
+            out["mid_video"] = mid
+        return out

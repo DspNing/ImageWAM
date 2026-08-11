@@ -22,32 +22,15 @@ fi
 
 RUN_ID="$1"
 SUBDIR="${2:-libero_plus}"
-
-# 支持绝对/相对路径: 以 / 或 ./ 开头时直接当输出目录
-if [[ "$RUN_ID" == /* || "$RUN_ID" == ./* ]]; then
-  OUT="$RUN_ID"
-  SUBDIR=$(basename "$(dirname "$OUT")")
-else
-  OUT="evaluate_results/${SUBDIR}/${RUN_ID}"
-fi
-
-PYBIN="${PYBIN:-python3}"
+OUT="evaluate_results/${SUBDIR}/${RUN_ID}"
+PYBIN="${PYBIN:-/home/NingZijian/miniconda3/envs/fastwam/bin/python}"
 
 [[ -d "$OUT" ]] || { echo "Error: 目录不存在: $OUT" >&2; exit 1; }
 
-# 动态读取总任务数: 从输出目录里被拷贝进来的 task list 文件数行数
-TASK_LIST_FILE=$(ls "$OUT"/*.txt 2>/dev/null | head -1)
-if [[ -n "$TASK_LIST_FILE" && -f "$TASK_LIST_FILE" ]]; then
-  NUM_SUITES=$(wc -l < "$TASK_LIST_FILE")
-  NUM_SUITES=${NUM_SUITES// /}
-  echo "任务清单: $(basename "$TASK_LIST_FILE") → $NUM_SUITES 个任务"
-else
-  # fallback: 硬编码默认值
-  if [[ "$SUBDIR" == "libero_plus" ]]; then NUM_SUITES=10030;
-  elif [[ "$SUBDIR" == "libero_pro" ]]; then NUM_SUITES=200;
-  else NUM_SUITES=40; fi
-  echo "未找到任务清单, 使用默认: $NUM_SUITES"
-fi
+# 各模式的 suite 数量(硬编码，可按需修改)
+if [[ "$SUBDIR" == "libero_plus" ]]; then NUM_SUITES=10030;
+elif [[ "$SUBDIR" == "libero_pro" ]]; then NUM_SUITES=200;
+else NUM_SUITES=40; fi
 
 # 每个任务的 trial 次数(可手动修改, 也可通过环境变量覆盖)
 #   libero_plus: 1,  libero/libero_pro: 50

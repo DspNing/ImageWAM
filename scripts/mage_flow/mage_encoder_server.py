@@ -25,6 +25,7 @@ import os
 import pickle
 import socketserver
 import struct
+import threading
 
 import torch
 from PIL import Image
@@ -52,9 +53,26 @@ def _send_msg(sock, obj):
     sock.sendall(struct.pack("<Q", len(payload)) + payload)
 
 
+def _safe_send(sock, obj):
+    """Send a message, swallowing a peer that already closed (BrokenPipe) so the
+    server doesn't dump a double traceback. Returns True on success."""
+    try:
+        _send_msg(sock, obj)
+        return True
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+        return False
+
+
 class _State:
     """Holds the loaded encoder expert. Populated once at startup."""
     expert: MageFlowVideoExpert | None = None
+
+
+# Serialize GPU work: encodes are GPU-bound and memory-hungry, so running them
+# concurrently on a single encoder would OOM / thrash. Accept/recv/send still
+# happen concurrently (see _UnixServer), which keeps the listen backlog drained
+# and prevents client `connect()` from getting EAGAIN under bursty 12-way load.
+_gpu_lock = threading.Lock()
 
 
 def _encode(instruction: str, image: torch.Tensor):
@@ -68,11 +86,12 @@ def _encode(instruction: str, image: torch.Tensor):
         Image.fromarray((x.permute(1, 2, 0).numpy() * 255).astype("uint8"))
         for x in refs
     ]
-    context, mask = expert.encode_edit_conditions(
-        [instruction] * refs.shape[0],
-        [[im] for im in pil_refs],
-        device=expert.device,
-    )
+    with _gpu_lock:
+        context, mask = expert.encode_edit_conditions(
+            [instruction] * refs.shape[0],
+            [[im] for im in pil_refs],
+            device=expert.device,
+        )
     return context.detach().cpu(), mask.detach().cpu()
 
 
@@ -80,25 +99,37 @@ class _Handler(socketserver.BaseRequestHandler):
     def handle(self):
         try:
             req = _recv_msg(self.request)
-        except Exception as exc:  # malformed / closed
+        except Exception:  # malformed / closed
             return
         op = req.get("op")
         if op == "ping":
-            _send_msg(self.request, {"ok": True})
+            if not _safe_send(self.request, {"ok": True}):
+                print(f"[mage-encoder-server] {self.client_address} gone before ping reply",
+                      flush=True)
         elif op == "encode":
             try:
                 ctx, msk = _encode(req["instruction"], req["image"])
-                _send_msg(self.request, {"context": ctx, "mask": msk})
             except Exception as exc:
-                _send_msg(self.request, {"error": f"{type(exc).__name__}: {exc}"})
+                if not _safe_send(self.request, {"error": f"{type(exc).__name__}: {exc}"}):
+                    print(f"[mage-encoder-server] {self.client_address} gone before error reply",
+                          flush=True)
+                return
+            if not _safe_send(self.request, {"context": ctx, "mask": msk}):
+                print(f"[mage-encoder-server] {self.client_address} gone before encode reply",
+                      flush=True)
         else:
-            _send_msg(self.request, {"error": f"unknown op: {op!r}"})
+            _safe_send(self.request, {"error": f"unknown op: {op!r}"})
 
 
-class _UnixServer(socketserver.UnixStreamServer):
-    """Serial (single-threaded) server: one request handled at a time."""
+class _UnixServer(socketserver.ThreadingUnixStreamServer):
+    """Threaded server: each connection handled in its own thread so the listen
+    backlog stays drained under many concurrent workers. GPU encodes are still
+    serialized via `_gpu_lock`."""
     allow_reuse_address = True
-    request_queue_size = 64  # large backlog so concurrent workers don't get EAGAIN on connect
+    # Backlog large enough to absorb a burst from all workers on this GPU.
+    request_queue_size = 64
+    # Reap handler threads so they don't accumulate across a long eval.
+    daemon_threads = True
 
 
 def main():

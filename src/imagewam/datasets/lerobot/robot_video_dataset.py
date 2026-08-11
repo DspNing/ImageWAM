@@ -207,6 +207,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_frame_cache_dir = video_frame_cache_dir
         self._video_frame_ondemand = False
         self._video_frame_mmap = None
+        self._video_frame_mmap_path = None
         self._video_frame_mmap_index = None
 
         if self.video_frame_cache_dir is not None and os.path.isdir(self.video_frame_cache_dir):
@@ -233,6 +234,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                         int(np.prod(self._video_frame_mmap_index["frame_shape"])),  # flattened size
                     ),
                 )
+                self._video_frame_mmap_path = mmap_data_path
                 logger.info(f"Video frame cache: mmap mode ({self._video_frame_mmap_index['num_frames']} frames, "
                            f"{self._video_frame_mmap_index['total_size_bytes']/1024**3:.2f}GB, loaded in {time.time()-_t0:.2f}s)")
             else:
@@ -249,6 +251,59 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             preload_qwen_cache = os.environ.get("IMAGEWAM_PRELOAD_QWEN_CACHE", "1") != "0"
             if preload_qwen_cache:
                 self._preload_qwen_text_cache()
+
+        # Sequentially read the video-frame mmap into the OS page cache once, in
+        # the main process, before DataLoader workers fork. The page cache is
+        # shared across all worker processes, so this removes the first-epoch
+        # random-read stalls (page faults to disk) that throttle throughput.
+        # Set IMAGEWAM_PREHEAT_VIDEO_MMAP=0 to skip.
+        if os.environ.get("IMAGEWAM_PREHEAT_VIDEO_MMAP", "1") != "0":
+            import torch.distributed as dist
+            _am_rank0 = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+            if _am_rank0:
+                self.preheat_video_mmap_cache()
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+
+
+    def preheat_video_mmap_cache(self, chunk_mb: int = 128) -> int:
+        """Read the video-frame mmap file sequentially to warm the OS page cache.
+
+        Uses ``POSIX_FADV_SEQUENTIAL`` so the kernel read-ahead is aggressive
+        (best for HDD). Returns bytes read (0 if no mmap is configured). Safe to
+        call when the cache is already warm — it just re-reads from RAM quickly.
+        """
+        if self._video_frame_mmap is None:
+            return 0
+        path = self._video_frame_mmap_path
+        if not path or not os.path.exists(path):
+            return 0
+        size = os.path.getsize(path)
+        chunk = int(chunk_mb) * 1024 ** 2
+        read = 0
+        last_gb = -1
+        _t0 = time.time()
+        logger.info(f"Video frame cache: preheating {size/1024**3:.2f}GB into page cache ...")
+        with open(path, "rb") as f:
+            try:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
+            except (AttributeError, OSError):
+                pass
+            while True:
+                buf = f.read(chunk)
+                if not buf:
+                    break
+                read += len(buf)
+                gb = read // (10 * 1024 ** 3)
+                if gb != last_gb:
+                    last_gb = gb
+                    logger.info(f"  preheat {read/1024**3:.0f}/{size/1024**3:.0f}GB ...")
+        _dt = time.time() - _t0
+        logger.info(
+            f"Video frame cache: preheat done ({size/1024**3:.2f}GB in {_dt:.1f}s, "
+            f"{size/1024**2/max(_dt,1e-6):.0f}MB/s)"
+        )
+        return read
 
     def __len__(self):
         return len(self.lerobot_dataset)

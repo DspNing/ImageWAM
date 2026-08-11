@@ -378,7 +378,7 @@ run_libero_eval() {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to clear tmux pane: $tmux_target"
             return 1
         fi
-        if ! tmux send-keys -t "$tmux_target" "${worker_env_cmd}cd $ROOT_DIR && export EXP_NAME=$EXP_NAME MUJOCO_GL=$MUJOCO_GL PYOPENGL_PLATFORM=$PYOPENGL_PLATFORM && \
+        if ! tmux send-keys -t "$tmux_target" "${worker_env_cmd}cd $ROOT_DIR && export EXP_NAME=$EXP_NAME MUJOCO_GL=$MUJOCO_GL PYOPENGL_PLATFORM=$PYOPENGL_PLATFORM IMAGE_SIZE=${IMAGE_SIZE:-224} && \
             ${worker_pythonpath_cmd} \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' && \
             CUDA_VISIBLE_DEVICES=$gpu_id ${worker_python_cmd} experiments/libero/eval_libero_single.py \

@@ -20,6 +20,9 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 
 from imagewam.models.backbones.mage_flow_video_expert import MageFlowVideoExpert
+from imagewam.utils.config_resolvers import register_default_resolvers  # noqa: E402
+
+register_default_resolvers()
 
 
 def parse_args():
@@ -32,6 +35,11 @@ def parse_args():
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--device", default="cuda")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument(
+        "--video-frame-cache-dir",
+        default=None,
+        help="data.train.video_frame_cache_dir override; must equal training's.",
+    )
     return p.parse_args()
 
 
@@ -56,34 +64,40 @@ def main():
     args = parse_args()
     root = Path(__file__).resolve().parents[2]
     config_dir = root / "configs"
+    overrides = [
+        f"task={args.task}",
+        "data.train.require_text_cache=false",
+        "data.train.text_embedding_cache_dir=null",
+        "data.train.qwen_text_cache_dir=null",
+        # This script produces Mage caches; do not make the dataset
+        # try to load the same cache before the missing entries exist.
+        "data.train.mage_text_cache_dir=null",
+        "data.train.video_augmentation=null",
+        # Keep the exact training index order used by ImageWAM.
+        "data.train.is_training_set=true",
+    ]
+    if args.video_frame_cache_dir:
+        # Pin the exact frame cache training uses so cache keys match.
+        overrides.append(
+            f"data.train.video_frame_cache_dir={args.video_frame_cache_dir}"
+        )
     with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         cfg = compose(
             config_name="train",
-            overrides=[
-                f"task={args.task}",
-                "data.train.require_text_cache=false",
-                "data.train.text_embedding_cache_dir=null",
-                "data.train.qwen_text_cache_dir=null",
-                # This script produces Mage caches; do not make the dataset
-                # try to load the same cache before the missing entries exist.
-                "data.train.mage_text_cache_dir=null",
-                "data.train.video_augmentation=null",
-                # Keep the exact training index order used by ImageWAM.
-                "data.train.is_training_set=true",
-            ],
+            overrides=overrides,
         )
     dataset = instantiate(cfg.data.train)
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    # Shard via custom env vars (NOT RANK/WORLD_SIZE) and use NO process group:
+    # this script is launched as independent single-GPU processes (see
+    # pre_compute_embed.sh). Each process sees one GPU and writes its own shard's
+    # files. Avoiding torchrun / init_process_group prevents the external
+    # mage_flow encoder from spinning up NCCL and timing out on cold-mmap I/O.
+    rank = int(os.environ.get("IMAGEWAM_SHARD_RANK", "0"))
+    world_size = int(os.environ.get("IMAGEWAM_SHARD_WORLD", "1"))
     total_samples = len(dataset)
-    owns_process_group = False
     if world_size > 1:
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("gloo")
-            owns_process_group = True
         dataset = Subset(dataset, range(rank, len(dataset), world_size))
-        if args.device == "cuda":
-            args.device = f"cuda:{int(os.environ.get('LOCAL_RANK', rank))}"
+    # args.device stays "cuda" -> cuda:0 (each process has exactly one visible GPU)
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=False,
@@ -107,8 +121,8 @@ def main():
                        if args.overwrite or not (out_dir / f"{key}.pt").exists()]
             if not missing:
                 count += len(instructions)
-                if count % 1000 == 0 or count == total_samples:
-                    print(f"[cache] {count} samples (all cached)", flush=True)
+                if count % 128 == 0 or count == total_samples:
+                    print(f"[shard{rank}] {count} samples (all cached)", flush=True)
                 continue
             missing_videos = videos[missing]
             missing_instructions = [instructions[row] for row in missing]
@@ -126,14 +140,12 @@ def main():
                     "instruction": instructions[row],
                 }, path)
             count += len(instructions)
-            print(f"[cache] {count} samples", flush=True)
+            print(f"[shard{rank}] {count} samples", flush=True)
             if args.max_samples is not None and count >= args.max_samples:
                 count = args.max_samples
                 break
     if world_size > 1:
-        torch.distributed.barrier()
-        if owns_process_group:
-            torch.distributed.destroy_process_group()
+        pass
     if rank != 0:
         return
     if hidden is None:

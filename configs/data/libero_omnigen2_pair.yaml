@@ -9,10 +9,10 @@ train:
     images:
       - key: image
         raw_shape: [3, 512, 512]
-        shape: [3, 112, 112]
+        shape: [3, "${envint:IMAGE_SIZE,224}", "${envint:IMAGE_SIZE,224}"]
       - key: wrist_image
         raw_shape: [3, 512, 512]
-        shape: [3, 112, 112]
+        shape: [3, "${envint:IMAGE_SIZE,224}", "${envint:IMAGE_SIZE,224}"]
     action:
       - key: default
         raw_shape: 7
@@ -24,7 +24,9 @@ train:
   num_frames: 17
   global_sample_stride: 1
   action_video_freq_ratio: 1
-  video_size: [112, 224]
+  # [H, W] — width = 2*H (two cameras concatenated horizontally).
+  # H follows IMAGE_SIZE (224 or 112); W derived automatically.
+  video_size: ["${envint:IMAGE_SIZE,224}", "${eval:${envint:IMAGE_SIZE,224} * 2}"]
   camera_key: null
   val_set_proportion: 0.0
   is_training_set: true
@@ -55,9 +57,9 @@ train:
     # agentview: full (color+corrupt+geom) — Camera/Noise/Background/Light all perturb it.
     # wrist: color only — Camera/Noise leave it invariant, so it stays a clean
     #   visual anchor while still receiving the shared lighting/texture variation.
-    camera_op_groups:
-      - [color, corrupt, geom]   # idx 0 = agentview (left half)
-      - [color]                  # idx 1 = wrist (right half)
+    camera_op_groups: null # null (close)
+      # - [color, corrupt, geom]   # idx 0 = agentview (left half)
+      # - [color]                  # idx 1 = wrist (right half)
   require_text_cache: false
   endpoint_frames_only: true
   qwen_text_cache_dir: ???
@@ -83,11 +85,11 @@ train:
     train_transforms:
       - _target_: imagewam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [112, 112]
+        size: ["${envint:IMAGE_SIZE,224}", "${envint:IMAGE_SIZE,224}"]
     val_transforms:
       - _target_: imagewam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [112, 112]
+        size: ["${envint:IMAGE_SIZE,224}", "${envint:IMAGE_SIZE,224}"]
   text_embedding_cache_dir: null
   context_len: 128
   # Pre-cached normalized action/proprio (skips parquet + processor)
@@ -98,4 +100,4 @@ train:
   # Set to directory containing frame_*.pt files to skip mp4 decode
   # Enable with: video_frame_cache_dir: ./data/video_frames_cache/libero
   # video_frame_cache_dir: null
-  video_frame_cache_dir: ./data/video_frames_cache/libero_flux2_mmap
+  video_frame_cache_dir: ./data/video_frames_cache/libero_224_mmap

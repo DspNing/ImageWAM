@@ -67,6 +67,11 @@ wandb:
   group: null
   mode: online
 
+# tensorboard (本地日志，默认开启，无需联网)
+tensorboard:
+  enabled: true
+  subdir: tensorboard   # 相对 output_dir 的子目录，留空则直接写入 output_dir
+
 hydra:
   job:
     chdir: false

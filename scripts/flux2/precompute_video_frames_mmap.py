@@ -57,73 +57,88 @@ def validate_files(frame_files: list[Path]) -> dict:
     return info
 
 
-def create_mmap_cache(frame_files: list[Path], output_mmap: Path, output_index: Path) -> dict:
-    """Create concatenated mmap file and index.
+def _worker_init(mmap_path, dtype_np, shape):
+    """Each worker opens the shared mmap (r+) for writing disjoint rows."""
+    global _W_MMAP
+    _W_MMAP = np.memmap(mmap_path, dtype=dtype_np, mode="r+", shape=shape)
+
+
+def _worker_load(args):
+    """Load one frame .pt and write its flattened bytes into the shared mmap row."""
+    i, path = args
+    tensor = torch.load(path, map_location="cpu", weights_only=True)
+    _W_MMAP[i] = tensor.numpy().reshape(-1)
+    return i
+
+
+def create_mmap_cache(frame_files: list[Path], output_mmap: Path, output_index: Path, workers: int = 16) -> dict:
+    """Create concatenated mmap file and index (multi-process).
 
     Args:
         frame_files: List of frame_*.pt files sorted by index
         output_mmap: Path to output mmap file
         output_index: Path to output index file
+        workers: Number of parallel loader processes
 
     Returns:
         Metadata about the created cache
     """
+    from multiprocessing import Pool
+
     # Load first file to get shape info
-    first_tensor = torch.load(frame_files[0], map_location="cpu", weights_only=False)
+    first_tensor = torch.load(frame_files[0], map_location="cpu", weights_only=True)
     frame_shape = first_tensor.shape  # [C, T, H, W]
     frame_dtype = first_tensor.dtype
     frame_size_bytes = first_tensor.numel() * first_tensor.element_size()
+    dtype_np = np.float32 if frame_dtype == torch.float32 else np.uint8
+    per_frame = first_tensor.numel()
 
-    print(f"\nCreating mmap cache:")
+    print(f"\nCreating mmap cache ({workers} workers):")
     print(f"  Frame shape: {frame_shape} [C, T, H, W]")
     print(f"  Frame dtype: {frame_dtype}")
     print(f"  Frame size: {frame_size_bytes} bytes")
     print(f"  Total frames: {len(frame_files)}")
     print(f"  Total size: {len(frame_files) * frame_size_bytes / 1024**3:.2f} GB")
 
-    # Calculate total size
     total_size = len(frame_files) * frame_size_bytes
 
-    # Create index metadata
+    # Create output directory
+    output_mmap.parent.mkdir(parents=True, exist_ok=True)
+
+    # Allocate the mmap file once (main process, w+), so workers can reopen r+.
+    print(f"\nAllocating {output_mmap} ({len(frame_files) * per_frame:,} elements)...")
+    alloc = np.memmap(output_mmap, dtype=dtype_np, mode="w+", shape=(len(frame_files), per_frame))
+    alloc.flush()
+    del alloc  # close main handle; workers reopen shared
+
+    # Pre-compute offsets (constant per-frame size)
+    offsets = torch.zeros(len(frame_files) + 1, dtype=torch.int64)
+    for i in range(len(frame_files)):
+        offsets[i + 1] = offsets[i] + frame_size_bytes
     index = {
         "num_frames": len(frame_files),
         "frame_shape": list(frame_shape),  # [C, T, H, W]
         "frame_dtype": str(frame_dtype),
         "frame_size_bytes": frame_size_bytes,
         "total_size_bytes": total_size,
-        "offsets": torch.zeros(len(frame_files) + 1, dtype=torch.int64),  # +1 for end marker
+        "offsets": offsets,  # +1 for end marker
     }
 
-    # Create output directory
-    output_mmap.parent.mkdir(parents=True, exist_ok=True)
-
-    # Initialize mmap file with zeros - use flattened shape for 1D array
-    # This is easier to work with: we'll flatten each frame to 1D
-    total_elements = len(frame_files) * first_tensor.numel()
-    print(f"\nWriting to {output_mmap}...")
-    print(f"  Total elements: {total_elements:,}")
-
-    mmap_array = np.memmap(
-        output_mmap,
-        dtype=np.float32 if frame_dtype == torch.float32 else np.uint8,
-        mode="w+",
-        shape=(len(frame_files), first_tensor.numel()),  # (num_frames, flattened_size)
-    )
-
-    # Copy each frame
+    # Parallel load + write. Each worker loads a .pt and writes one mmap row.
+    args_iter = list(enumerate(str(p) for p in frame_files))
     t0 = time.time()
-    with tqdm(total=len(frame_files), desc="Copying frames", unit="frames") as pbar:
-        for i, frame_path in enumerate(frame_files):
-            tensor = torch.load(frame_path, map_location="cpu", weights_only=False)
-            # Flatten the tensor to 1D and store
-            mmap_array[i] = tensor.numpy().reshape(-1)
-            index["offsets"][i + 1] = index["offsets"][i] + frame_size_bytes
+    done = 0
+    with Pool(workers, initializer=_worker_init,
+              initargs=(str(output_mmap), dtype_np, (len(frame_files), per_frame))) as pool, \
+         tqdm(total=len(frame_files), desc="Copying frames", unit="frames") as pbar:
+        for _ in pool.imap_unordered(_worker_load, args_iter, chunksize=32):
+            done += 1
             pbar.update(1)
-
-    # Flush mmap to disk
-    mmap_array.flush()
+            if done % 5000 == 0:
+                elapsed = time.time() - t0
+                print(f"  done={done}/{len(frame_files)} rate={done/elapsed:.1f}/s "
+                      f"eta={(len(frame_files)-done)/max(done/elapsed,1e-9)/3600:.1f}h", flush=True)
     elapsed = time.time() - t0
-
     print(f"Completed in {elapsed:.1f}s ({len(frame_files)/elapsed:.1f} frames/s)")
 
     # Save index
@@ -159,6 +174,12 @@ def main():
         action="store_true",
         help="Only validate input files without creating mmap",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Number of parallel loader processes (default 16)",
+    )
     args = parser.parse_args()
 
     # Get frame files
@@ -176,7 +197,7 @@ def main():
     output_mmap = Path(args.output_dir) / "video_frames.mmap"
     output_index = Path(args.output_dir) / "video_frames_index.pt"
 
-    result = create_mmap_cache(frame_files, output_mmap, output_index)
+    result = create_mmap_cache(frame_files, output_mmap, output_index, workers=args.workers)
 
     print(f"\n✅ Mmap cache created successfully:")
     print(f"  Output: {args.output_dir}")

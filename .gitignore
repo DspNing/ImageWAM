@@ -248,6 +248,7 @@ report.xml
 
 # CI-CD
 temp/
+tmp/
 envs.txt
 manifest.json
 
@@ -288,3 +289,5 @@ docs/huggingface_model_card_template.md
 task_lists/
 tests/
 docs/
+notebook/
+real_device/

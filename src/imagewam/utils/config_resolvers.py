@@ -1,4 +1,5 @@
 import math
+import os
 from pathlib import Path
 from typing import Any, List, Callable, Optional
 from omegaconf import OmegaConf
@@ -7,6 +8,19 @@ from omegaconf import OmegaConf
 def _register(name: str, func: Callable) -> None:
     """Idempotently register a resolver, replacing any existing one."""
     OmegaConf.register_new_resolver(name, func, replace=True)
+
+
+def _envint(name: str, default) -> int:
+    """Read an env var as int, falling back to int(default) when unset/empty.
+
+    Used in configs as ${envint:IMAGE_SIZE,224} so image-size dependent fields
+    stay type-safe int (a raw ${oc.env:...} would yield a str and break the
+    shape assertion in base_processor).
+    """
+    val = os.environ.get(name)
+    if val is None or val == "":
+        return int(default)
+    return int(val)
 
 def _oc_load(path: str, key: Optional[str] = None) -> Any:
     """
@@ -61,6 +75,7 @@ def register_default_resolvers() -> None:
     Safe to call multiple times.
     """
     _register("oc.load", _oc_load)
+    _register("envint", _envint)
     _register("eval", eval) # allows arbitrary python code execution in configs using the ${eval:''} resolver
     _register("split", lambda s, idx: s.split('/')[int(idx)]) # split string
     _register("max", lambda x: max(x))

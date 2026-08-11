@@ -66,6 +66,8 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        self.tensorboard_enabled = bool(getattr(cfg, "tensorboard", {}).get("enabled", False)) \
+            if getattr(cfg, "tensorboard", None) is not None else False
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -156,6 +158,8 @@ class Wan22Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
         self._init_wandb()
+        self.tb_writer = None
+        self._init_tensorboard()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
@@ -196,6 +200,51 @@ class Wan22Trainer:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    def _init_tensorboard(self):
+        """Initialize a local TensorBoard SummaryWriter.
+
+        Uses torch.utils.tensorboard (no extra dependency beyond tensorboardX /
+        the `tensorboard` pip package, which is already a torch dependency).
+        Only the main process writes.
+        """
+        if not self.tensorboard_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as e:
+            raise ImportError(
+                "tensorboard logging is enabled in config (`tensorboard.enabled=true`) "
+                "but torch.utils.tensorboard is unavailable. Install `tensorboard`."
+            ) from e
+
+        tb_cfg = self.cfg.tensorboard
+        subdir = getattr(tb_cfg, "subdir", None)
+        if subdir in (None, "null", ""):
+            log_dir = self.output_dir
+        else:
+            log_dir = os.path.join(self.output_dir, str(subdir))
+        ensure_dir(log_dir)
+        self.tb_writer = SummaryWriter(log_dir=log_dir)
+        # Record the resolved log_dir so the user knows where to run `tensorboard --logdir`.
+        self._tb_log_dir = log_dir
+        logger.info("Initialized tensorboard SummaryWriter: logdir=%s", log_dir)
+
+    def _tb_log(self, payload: dict):
+        if self.tb_writer is None:
+            return
+        for key, value in payload.items():
+            try:
+                self.tb_writer.add_scalar(key, float(value), self.global_step)
+            except (TypeError, ValueError):
+                # Skip non-scalar payloads (e.g. images) silently for now.
+                continue
+
+    def _finish_tensorboard(self):
+        if self.tb_writer is None:
+            return
+        self.tb_writer.close()
+        self.tb_writer = None
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -683,7 +732,7 @@ class Wan22Trainer:
             or is_dim_stack
             or is_mage_flow_stack
         )
-        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
+        rng = torch.Generator(device="cpu").manual_seed(1234 + self.accelerator.process_index)
         eval_indices = torch.randint(
             0,
             len(self.val_dataset),
@@ -1161,9 +1210,10 @@ class Wan22Trainer:
                         for key, value in objective_loss_dict.items():
                             loss_dict[key] = float(value)
 
+                        self._rank_timer_sync(timer_active)
                         objective_backward_start = time.perf_counter()
                         self.accelerator.backward(objective_loss)
-                        backward_elapsed += time.perf_counter() - objective_backward_start
+                        self._rank_timer_sync(timer_active)
 
                     if objective_count <= 0:
                         raise RuntimeError("`iter_training_losses` yielded no training losses.")
@@ -1171,10 +1221,12 @@ class Wan22Trainer:
                     forward_start = time.perf_counter()
                     with self.accelerator.autocast():
                         loss, loss_dict = train_model.training_loss(sample)
+                    self._rank_timer_sync(timer_active)
                     forward_elapsed = time.perf_counter() - forward_start
 
                     backward_start = time.perf_counter()
                     self.accelerator.backward(loss)
+                    self._rank_timer_sync(timer_active)
                     backward_elapsed = time.perf_counter() - backward_start
 
                 self._rank_timer_sync(timer_active)
@@ -1237,7 +1289,7 @@ class Wan22Trainer:
                         )
                         logger.info(description)
 
-                        wandb_payload = {
+                        train_payload = {
                             "train/loss": global_loss,
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
@@ -1245,8 +1297,9 @@ class Wan22Trainer:
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
                         }
                         for key, value in global_loss_metrics.items():
-                            wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
+                            train_payload[f"train/{key}"] = value
+                        self._wandb_log(train_payload)
+                        self._tb_log(train_payload)
 
                     if should_log_timer and self.accelerator.is_main_process:
                         logger.info(
@@ -1302,6 +1355,7 @@ class Wan22Trainer:
                             for _k in per_cam_keys:
                                 eval_payload[f"eval/{_k}"] = float(metrics[_k])
                             self._wandb_log(eval_payload)
+                            self._tb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
@@ -1322,6 +1376,8 @@ class Wan22Trainer:
                                 ckpt_info["weights_path"],
                                 ckpt_info["state_path"],
                             )
+                        self._finish_tensorboard()
+                        self._finish_wandb()
                         return
 
         ckpt_info = self.save_checkpoint()
@@ -1332,4 +1388,6 @@ class Wan22Trainer:
                 ckpt_info["weights_path"],
                 ckpt_info["state_path"],
             )
+        self._finish_tensorboard()
+        self._finish_wandb()
         

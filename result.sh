@@ -1,6 +1,6 @@
 MODE=plus   # master | plus | pro
 
-OUT=./evaluate_results/libero_plus/eval_20260712_204812
+OUT=./evaluate_results/libero_plus/eval_20260809_125443
 # OUT=./evaluate_results/libero_plus/eval_20260628_232624-wan21
 # OUT=./evaluate_results/libero_plus/eval_20260621_184344-wan22-release
 find $OUT -name "gpu*_task*_results.json" | wc -l   # 完成数 / 总任务数

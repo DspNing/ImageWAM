@@ -43,9 +43,9 @@ from imagewam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
 from action_ensembler import ActionEnsembler
 
-OmegaConf.register_new_resolver("eval", eval)
-OmegaConf.register_new_resolver("max", lambda x: max(x))
-OmegaConf.register_new_resolver("split", lambda s, idx: s.split("/")[int(idx)])
+from imagewam.utils.config_resolvers import register_default_resolvers
+
+register_default_resolvers()
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -438,7 +438,10 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
     if not bool(cfg.EVALUATION.get("visualize_future_video", False)):
         return
 
-    action_conditioned = cfg.model.video_dit_config.get("action_conditioned", None)
+    vdit_cfg = OmegaConf.select(cfg.model, "video_dit_config", default=None)
+    if vdit_cfg is None:
+        return
+    action_conditioned = vdit_cfg.get("action_conditioned", None)
     if action_conditioned is not False:
         raise ValueError(
             "EVALUATION.visualize_future_video=true requires "
@@ -634,14 +637,10 @@ def _predict_action_chunk(
     # encoder in every worker. The server runs the identical encode_edit_conditions
     # (same image denorm + PIL + call), so the context is bit-identical to local
     # online encoding -> zero accuracy change.
-    import time as _time
     _mage_enc_sock = os.environ.get("MAGE_ENCODER_SOCKET")
-    _t_enc = 0.0
     if _mage_enc_sock:
         from mage_encoder_client import encode_context
-        _t0 = _time.time()
         _ctx, _msk = encode_context(_mage_enc_sock, prompt, image)
-        _t_enc = _time.time() - _t0
         infer_kwargs["context"] = _ctx.to(model_device, dtype=model.torch_dtype)
         infer_kwargs["context_mask"] = _msk.to(model_device)
     elif text_cache is not None:
@@ -667,36 +666,25 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = 2 if endpoint_frames_only else _get_num_video_frames(cfg)
 
     with torch.no_grad():
-        _t1 = _time.time()
         if visualize_future_video:
             pred = model.infer_joint(**infer_kwargs)
-            predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
-            if endpoint_frames_only:
-                # Endpoint-frame inference returns only the future target.
-                # The rollout clip still starts with the current observation.
-                current_image = _frame_to_rgb_array(imgs).astype(np.uint8)
-                if predicted_future_frames:
-                    target_h, target_w = np.asarray(predicted_future_frames[0]).shape[:2]
-                    current_image = np.asarray(
-                        Image.fromarray(current_image).resize(
-                            (target_w, target_h), resample=Image.BILINEAR
-                        )
-                    )
-                predicted_future_frames.insert(
-                    0, Image.fromarray(current_image)
-                )
+            # predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+            # if endpoint_frames_only:
+            #     # Endpoint-frame inference returns only the future target.
+            #     # The rollout clip still starts with the current observation.
+            #     current_image = _frame_to_rgb_array(imgs).astype(np.uint8)
+            #     if predicted_future_frames:
+            #         target_h, target_w = np.asarray(predicted_future_frames[0]).shape[:2]
+            #         current_image = np.asarray(
+            #             Image.fromarray(current_image).resize(
+            #                 (target_w, target_h), resample=Image.BILINEAR
+            #             )
+            #         )
+            #     predicted_future_frames.insert(
+            #         0, Image.fromarray(current_image)
+            #     )
         else:
             pred = model.infer_action(**infer_kwargs)
-        _t_infer = _time.time() - _t1
-        # Log timing breakdown every 50 steps to avoid spam
-        _step_counter = getattr(_predict_action_chunk, "_step_counter", 0) + 1
-        _predict_action_chunk._step_counter = _step_counter
-        _replan = int(cfg.EVALUATION.get("replan_steps", "?"))
-        if _step_counter % 50 == 1:
-            logging.info(
-                f"[timing] replan_steps={_replan}  encoder_rpc={1000*_t_enc:.0f}ms  "
-                f"model_infer={1000*_t_infer:.0f}ms  total={1000*(_t_enc+_t_infer):.0f}ms"
-            )
             # infer_kwargs["num_video_frames"] = 2 if endpoint_frames_only else _get_num_video_frames(cfg)
             # pred = model.infer_joint(**infer_kwargs)
 
@@ -714,13 +702,21 @@ def _predict_action_chunk(
 
 
 def _get_max_steps(task_suite_name: str) -> int:
+    # fair test
     suite_steps = {
-        "libero_spatial": 400,
-        "libero_object": 400,
-        "libero_goal": 400,
-        "libero_10": 700,
-        "libero_90": 700,
+        "libero_spatial": 280,
+        "libero_object": 280,
+        "libero_goal": 300,
+        "libero_10": 520,
+        "libero_90": 400,
     }
+    # suite_steps = {
+    #     "libero_spatial": 400,
+    #     "libero_object": 400,
+    #     "libero_goal": 400,
+    #     "libero_10": 700,
+    #     "libero_90": 700,
+    # }
     if task_suite_name not in suite_steps:
         raise ValueError(f"Unknown task suite: {task_suite_name}")
     return suite_steps[task_suite_name]
