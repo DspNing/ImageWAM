@@ -5,6 +5,8 @@
 #   bash watch_progress.sh <RUN_ID>              # 默认 libero_plus
 #   bash watch_progress.sh <RUN_ID> libero       # master 推理(原版 LIBERO)
 #   bash watch_progress.sh <RUN_ID> libero_pro   # LIBERO-PRO OOD 推理
+#   bash watch_progress.sh /abs/path/to/result_dir [libero|libero_plus|libero_pro]
+#                                                # 绝对路径:直接监控该目录,模式仍由第二参指定
 #   REFRESH=5 NUM_TRIALS=30 bash watch_progress.sh <RUN_ID> libero_pro   # 自定义 trials 数
 #
 # 可调变量:
@@ -16,13 +18,18 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "用法: bash watch_progress.sh <RUN_ID> [libero|libero_plus|libero_pro]"
+  echo "用法: bash watch_progress.sh <RUN_ID 或 绝对路径> [libero|libero_plus|libero_pro]"
   exit 1
 fi
 
 RUN_ID="$1"
 SUBDIR="${2:-libero_plus}"
-OUT="evaluate_results/${SUBDIR}/${RUN_ID}"
+if [[ "$RUN_ID" = /* ]]; then
+  # 绝对路径:直接作为结果目录
+  OUT="$RUN_ID"
+else
+  OUT="evaluate_results/${SUBDIR}/${RUN_ID}"
+fi
 PYBIN="${PYBIN:-/home/NingZijian/miniconda3/envs/fastwam/bin/python}"
 
 [[ -d "$OUT" ]] || { echo "Error: 目录不存在: $OUT" >&2; exit 1; }

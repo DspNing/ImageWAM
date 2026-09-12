@@ -702,21 +702,15 @@ def _predict_action_chunk(
 
 
 def _get_max_steps(task_suite_name: str) -> int:
-    # fair test
+    # 2026-09-08 恢复 Ning 08-21 锚点协议(曾为 quick test 缩成 280/280/300/520/400
+    # 并随 3bd7228 提交;num_steps_wait=30 在 configs/sim_libero.yaml,勿动)。
     suite_steps = {
-        "libero_spatial": 280,
-        "libero_object": 280,
-        "libero_goal": 300,
-        "libero_10": 520,
-        "libero_90": 400,
+        "libero_spatial": 400,
+        "libero_object": 400,
+        "libero_goal": 400,
+        "libero_10": 700,
+        "libero_90": 700,
     }
-    # suite_steps = {
-    #     "libero_spatial": 400,
-    #     "libero_object": 400,
-    #     "libero_goal": 400,
-    #     "libero_10": 700,
-    #     "libero_90": 700,
-    # }
     if task_suite_name not in suite_steps:
         raise ValueError(f"Unknown task suite: {task_suite_name}")
     return suite_steps[task_suite_name]

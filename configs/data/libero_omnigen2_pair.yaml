@@ -54,12 +54,14 @@ train:
     exposure:
       ev_range: [-0.25, 0.25]
     # LIBERO-Plus oriented per-camera policy (aligned to [agentview, wrist]).
+    # MUST match the 81.36 baseline run (Ning 2026-08-19_17-41-03) exactly —
+    # the baseline comparison is single-variable only if this augmentation
+    # policy is identical (it directly shapes bg/layout exposure).
     # agentview: full (color+corrupt+geom) — Camera/Noise/Background/Light all perturb it.
-    # wrist: color only — Camera/Noise leave it invariant, so it stays a clean
-    #   visual anchor while still receiving the shared lighting/texture variation.
-    camera_op_groups: null # null (close)
-      # - [color, corrupt, geom]   # idx 0 = agentview (left half)
-      # - [color]                  # idx 1 = wrist (right half)
+    # wrist: color+corrupt per the baseline config.
+    camera_op_groups:
+      - [color, corrupt, geom]   # idx 0 = agentview (left half)
+      - [color, corrupt]         # idx 1 = wrist (right half)
   require_text_cache: false
   endpoint_frames_only: true
   qwen_text_cache_dir: ???

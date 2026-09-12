@@ -602,6 +602,7 @@ class ImageWAM(torch.nn.Module):
         load_text_encoder: bool = True,
         per_segment_temb: bool = False,
         mid_layer_index: Optional[int] = None,
+        delta_dynamics: dict[str, Any] | None = None,
     ):
         from .mage_flow_action import MageFlowActionDiT
         from .mot import MoT
@@ -615,6 +616,7 @@ class ImageWAM(torch.nn.Module):
         )
         action_cfg = dict(action_dit_config or {})
         action_dim = int(action_cfg.pop("action_dim"))
+        _dd = dict(delta_dynamics) if delta_dynamics else None
         action_expert = MageFlowActionDiT.from_video_transformer(
             video_expert.transformer,
             action_dim=action_dim,
@@ -626,7 +628,8 @@ class ImageWAM(torch.nn.Module):
         )
         mot = MoT(
             {"video": video_expert, "action": action_expert},
-            mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn))
+            mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+            delta_dynamics_cfg=(_dd if _dd and _dd.get("enabled", True) else None))
         sched_v = dict(video_scheduler or {})
         sched_a = dict(action_scheduler or {})
         if not {"train_shift", "infer_shift", "num_train_timesteps"} <= set(sched_a):
@@ -1560,7 +1563,37 @@ class ImageWAM(torch.nn.Module):
         loss_dict["loss_video_wrist"] = self.loss_lambda_video * float(
             (wrist_loss * video_weight).mean().detach()
         )
-        return self.loss_lambda_video * lv + self.loss_lambda_action * la + lm, loss_dict
+        # Delta-dynamics branch (training-only): shape the trunk by predicting
+        # the main-camera latent delta dz = z(t+16) - z(t) from the final-layer
+        # reference features + the GT action chunk. Both latents already sit in
+        # `inputs`; the head detaches the target and returns (weighted, raw).
+        total = self.loss_lambda_video * lv + self.loss_lambda_action * la + lm
+        dd = getattr(self.mot, "delta_dynamics", None)
+        # 只在训练模式跑 delta 头(同 mid 头的门控,审计 4.4)。注意必须判
+        # mot 的 training 标志:本栈的冻结策略是 model.eval() 后仅 model.dit(=mot)
+        # .train(),顶层 ImageWAM 的 self.training 在整个训练期恒为 False——
+        # 昨天误判了顶层标志,导致头建了但从未运行(2026-08-24 19:40 run 实录)。
+        # 验证前向(model.eval() 全模块)时 mot.training=False → 跳过:
+        # val loss 口径与历史一致,warmup 计数不被验证推进。
+        if dd is not None and self.mot.training:
+            # delta/delta_tol 共用末层输出切片 ref_hidden(v1 原位,逐位兼容)。
+            _dd_in = out.get("ref_hidden")
+            if _dd_in is None:
+                # 审计 F11-2:静默跳过会让 delta 损失在重构后无声消失,必须炸。
+                raise RuntimeError(
+                    "delta_dynamics is enabled but the MoT forward returned no "
+                    "'ref_hidden' anchor — the delta loss would be silently "
+                    "dropped. Check mot._forward_mage_flow return_ref_hidden.")
+            proprio = sample.get("proprio")
+            delta_weighted, delta_raw = dd(
+                _dd_in, action, proprio,
+                inputs["ref_image_latents"], inputs["target_latent"])
+            total = total + delta_weighted
+            loss_dict["loss_delta"] = float(delta_weighted.detach())
+            # F1 在线诊断:raw(未乘 λ/warmup)。零基线参考 = mean|dz_main| ≈ 0.246
+            # (gate 提取实测);raw 长期贴地(>0.20)提示 no-op(头没逼出塑形压力)。
+            loss_dict["loss_delta_raw"] = float(delta_raw)
+        return total, loss_dict
 
     @staticmethod
     def _mage_image_token_length(latent: torch.Tensor) -> int:

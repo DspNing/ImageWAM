@@ -167,7 +167,7 @@ run_libero_plus_batch() {
             local _srvlog="$TASK_LOG_DIR/encoder_gpu*.log"
             local _ready=false
             local _
-            for _ in $(seq 1 150); do  # up to ~5 min
+            for _ in $(seq 1 450); do  # up to ~15 min (2026-09-08: 节点缓存竞争下大权重加载可超 5min,曾误杀服务)
                 if [[ -S "$_sock" ]]; then _ready=true; break; fi
                 if ! kill -0 "$_pid" 2>/dev/null; then
                     echo "[plus-batch] ERROR: encoder server pid=$_pid died before ready. Log: $_srvlog" >&2
@@ -206,6 +206,10 @@ run_libero_plus_batch() {
 
         CONDA_ENV="${CONDA_ENV:-mageflow}"
         WORKER_THREADS="${WORKER_THREADS:-3}"
+        # 非交互 shell 里 conda activate 必须先 source conda.sh。默认值放在使用点
+        # 旁边:它曾只作为 run_eval.sh 的未提交导出存在,2026-08-30 回滚时被冲掉,
+        # 08-31 的 eval worker 因此全数 CondaError 秒退。
+        WORKER_ENV_SOURCE="${WORKER_ENV_SOURCE:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 
         # Shared-encoder mode: point this worker at its GPU's encoder server and
         # skip loading the text encoder locally. load_text_encoder=false is appended

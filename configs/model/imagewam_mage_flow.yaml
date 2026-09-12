@@ -29,6 +29,31 @@ action_dit_config:
   pretrained_path: null
   max_action_horizon: 64
 
+# 变化量预测分支(2026-08-23):训练期外挂头,从 video expert 最后一层参考帧
+# token 特征预测主相机区 latent 变化量 dz = z(t+16) - z(t)(固定相机下背景
+# 在相减中代数消掉)。塑形主干以对抗"2.2x→5.0x 放大"(探针结论);推理时
+# 整个头不加载,eval 栈零改动;enabled=false 时前向与现状逐位一致。
+# 生死门 GO:perturb_probe/results/delta_gate/report.txt。
+# 2026-09-03 复活:回滚后的干净 baseline 之上从头全量训练(不再是 addr ckpt 微调)。
+# kind 选择器:
+#   delta     = dz 回归头(v1 原头,逐位监督,默认);
+#   delta_tol = 邻域容差版(2026-09-07,监督空间精确度放宽,见 tolerant_delta_head.py)。
+delta_dynamics:
+  enabled: false
+  kind: delta          # delta | delta_tol
+  tol_kernel: 3        # 仅 delta_tol:邻域核宽(奇数),1=严格退回 v1 逐位匹配
+  tol_mode: pool       # 仅 delta_tol:pool=目标侧窗均值池化(主推,位移完全解耦)
+                       #   nbmean=邻域均匀平均 L1(对照;高对比场解耦弱,见头 docstring)
+  hidden: 1024
+  depth: 4
+  num_heads: 8
+  loss_lambda: 0.5
+  warmup_steps: 1
+  action_dim: 7
+  proprio_dim: 8
+  latent_channels: 128
+  action_horizon: 16
+
 video_scheduler:
   train_shift: 6.0
   infer_shift: 6.0

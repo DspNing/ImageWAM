@@ -84,7 +84,10 @@ def collect_results(output_dir: str) -> list[dict]:
         results.append(
             {
                 "suite": suite,
-                "task_id": int(task_id),
+                # result files are 0-indexed; classification is 1-indexed
+                # (same remap as summarize_by_category.py; without it the first
+                # task of each suite is silently dropped from the summary)
+                "task_id": int(task_id) + 1,
                 "success_rate": 100.0 * succ / total,
                 "duration": r.get("duration"),
             }

@@ -14,7 +14,7 @@
 
 # ==================== 参数块（按需修改）====================
 MODE="plus"                                       # "plus" | "master"
-GPUS="4,5"                                    # 用哪些卡，逗号分隔
+GPUS="6,7"                                    # 用哪些卡，逗号分隔
 MAGE_FLOW_VARIANT="${MAGE_FLOW_VARIANT:-base}"
 
 #   plus : 传入任务清单文件路径（或由调度脚本自动生成）
@@ -23,7 +23,7 @@ TASK_LIST="./task_lists/libero_plus_all.txt"                                    
 
 # checkpoint 路径（必填）：
 # CKPT="./checkpoints/imagewam_release/libero/flux2_klein_4b/model.pt"
-CKPT="./runs/libero_mage_flow_imagewam/2026-08-10_08-19-01/checkpoints/weights/step_043400.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
+CKPT="/data/WuKefei/ImageWAM/runs/libero_mage_flow_imagewam/2026-09-09_08-45-50/checkpoints/weights/step_048000.pt"                                           # 例如 "./runs/xxx/checkpoints/weights/step_040000.pt"
 
 # dataset_stats 路径（留空 = 自动从 ckpt 父目录查找）：
 STATS="./data/dataset_stats.json"

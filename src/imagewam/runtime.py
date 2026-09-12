@@ -404,6 +404,7 @@ def create_imagewam_mage_flow(
     load_text_encoder: bool = True,
     per_segment_temb: bool = False,
     mid_layer_index: int | None = None,
+    delta_dynamics=None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -415,6 +416,7 @@ def create_imagewam_mage_flow(
             return OmegaConf.to_container(value, resolve=True)
         return {} if value is None else dict(value)
 
+    _dd = as_dict(delta_dynamics)
     return ImageWAM.from_mage_flow_pretrained(
         mage_flow_model_path=mage_flow_model_path,
         mage_flow_src_path=mage_flow_src_path,
@@ -427,6 +429,7 @@ def create_imagewam_mage_flow(
         load_text_encoder=bool(load_text_encoder),
         per_segment_temb=bool(per_segment_temb),
         mid_layer_index=None if mid_layer_index is None else int(mid_layer_index),
+        delta_dynamics=(_dd if _dd and _dd.get("enabled", True) else None),
         device=device,
         torch_dtype=model_dtype,
     )

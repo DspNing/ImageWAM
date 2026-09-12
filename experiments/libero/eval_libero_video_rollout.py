@@ -342,7 +342,9 @@ def _filter_tasks_by_category(cfg: DictConfig, category: str) -> list[tuple[str,
     for suite_name, tasks in classification.items():
         for task_info in tasks:
             if task_info.get("category") == target_category:
-                choices.append((suite_name, int(task_info["id"])))
+                # classification ids are 1-indexed; suite.get_task() is 0-indexed
+                # (same remap as summarize_by_category.py)
+                choices.append((suite_name, int(task_info["id"]) - 1))
 
     if not choices:
         raise ValueError(f"No tasks found for category: {target_category}")

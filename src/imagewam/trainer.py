@@ -757,7 +757,9 @@ class Wan22Trainer:
                 sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
                 # 1. training loss
-                with self.accelerator.autocast():
+                # no_grad(审计 4.4):验证前向不建图——省显存,也保证任何训练期
+                # 辅助头(delta 等)不会在 val 里产生梯度/计数副作用。
+                with torch.no_grad(), self.accelerator.autocast():
                     val_loss, _ = model.training_loss(sample)
                     val_loss = val_loss.float().item()
 

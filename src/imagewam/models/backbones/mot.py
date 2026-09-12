@@ -127,6 +127,7 @@ class MoT(nn.Module):
         mot_checkpoint_mixed_attn: bool = True,
         gqa_implementation: str = "repeat",
         force_flash_attention: bool = False,
+        delta_dynamics_cfg: Dict[str, object] | None = None,
     ):
         super().__init__()
         if not mixtures:
@@ -181,6 +182,73 @@ class MoT(nn.Module):
             for attr, (got, expected) in checks.items():
                 if got != expected:
                     raise ValueError(f"All experts must share {attr}; got {got} vs {expected} for expert {name}.")
+
+        # Delta-dynamics head (2026-08): training-only auxiliary branch on the
+        # FINAL-layer reference-token hidden features. Predicts the main-camera
+        # latent delta dz = z(t+16) - z(t); background cancels algebraically
+        # under a static camera, so the target forces object/dynamics reading
+        # and shapes the trunk (the A6/A3-diagnosed amplification lesion).
+        # Inference never builds it; `return_ref_hidden` gates the (cheap)
+        # gather so the disabled path stays bitwise identical.
+        self.delta_dynamics = None
+        self.return_ref_hidden = False
+        if delta_dynamics_cfg:
+            if self.block_protocol != "mage_flow":
+                raise ValueError("delta_dynamics is only wired for the mage_flow protocol.")
+            _dd = dict(delta_dynamics_cfg)
+            # kind 选择器:delta=回归 latent 变化量(原头,逐位向后兼容);
+            # delta_tol=邻域容差版(监督空间精确度放宽,见 tolerant_delta_head.py)。
+            _kind = str(_dd.get("kind", "delta")).lower()
+            if _kind not in ("delta", "delta_tol"):
+                raise ValueError(
+                    f"delta_dynamics.kind must be delta|delta_tol, got {_kind!r}")
+            _trunk_dim = int(self.mixtures["video"].transformer.inner_dim)
+            _dtype = next(self.mixtures["video"].parameters()).dtype
+            if _kind in ("delta", "both"):
+                from .delta_dynamics import DeltaDynamicsHead
+                self.delta_dynamics = DeltaDynamicsHead(
+                    trunk_dim=_trunk_dim,
+                    action_dim=int(_dd.get("action_dim", 7)),
+                    proprio_dim=int(_dd.get("proprio_dim", 8) or 0),
+                    latent_channels=int(_dd.get("latent_channels", 128)),
+                    action_horizon=int(_dd.get("action_horizon", 16)),
+                    hidden=int(_dd.get("hidden", 1024)),
+                    depth=int(_dd.get("depth", 4)),
+                    num_heads=int(_dd.get("num_heads", 8)),
+                    loss_lambda=float(_dd.get("loss_lambda", 0.1)),
+                    warmup_steps=int(_dd.get("warmup_steps", 1000)),
+                ).to(dtype=_dtype)
+            elif _kind == "delta_tol":
+                # 邻域容差版(2026-09-07):同 v1 头结构/末层输出锚点/零初始化,
+                # 只把监督匹配从逐位放宽到主相机 7×7 网格上的 k×k 合法邻域均匀
+                # 平均(Camera −4.37 的空间锁定病灶;设计见 tolerant_delta_head.py)。
+                # 走同一个 self.delta_dynamics 槽位 → imagewam 损失分支/监控键零改动。
+                from .tolerant_delta_head import TolerantDeltaHead
+                self.delta_dynamics = TolerantDeltaHead(
+                    trunk_dim=_trunk_dim,
+                    grid_h=int(_dd.get("grid_h", 7)),
+                    grid_w=int(_dd.get("grid_w", 14)),
+                    tol_kernel=int(_dd.get("tol_kernel", 3)),
+                    tol_mode=str(_dd.get("tol_mode", "pool")),
+                    action_dim=int(_dd.get("action_dim", 7)),
+                    proprio_dim=int(_dd.get("proprio_dim", 8) or 0),
+                    latent_channels=int(_dd.get("latent_channels", 128)),
+                    action_horizon=int(_dd.get("action_horizon", 16)),
+                    hidden=int(_dd.get("hidden", 1024)),
+                    depth=int(_dd.get("depth", 4)),
+                    num_heads=int(_dd.get("num_heads", 8)),
+                    loss_lambda=float(_dd.get("loss_lambda", 0.1)),
+                    warmup_steps=int(_dd.get("warmup_steps", 1000)),
+                ).to(dtype=_dtype)
+            self.return_ref_hidden = True
+            _tol = getattr(self.delta_dynamics, "tol_kernel", None)
+            logger.info(
+                "MoT aux head ENABLED kind=%s: trunk_dim=%d hidden=%d depth=%d "
+                "lambda=%.2f warmup=%d%s (training-only; output layer zero-init)",
+                _kind, _trunk_dim, int(_dd.get("hidden", 1024)),
+                int(_dd.get("depth", 4)), float(_dd.get("loss_lambda", 0.1)),
+                int(_dd.get("warmup_steps", 1000)),
+                f" tol_kernel={_tol}" if _tol is not None else "")
 
         logger.info(
             "Initialized MoT with experts=%s protocol=%s layers=%d heads=%d kv_heads=%d head_dim=%d",
@@ -1375,6 +1443,11 @@ class MoT(nn.Module):
                 attention_mask[:, prefix_len:total_len, :total_len],
             )
             action = ablock.apply_attention(mixed, state)
+        # 与训练尾部(_forward_mage_flow 末尾)对齐:那里 action 先过
+        # action_expert.final_norm 才交给 post_dit(内含第二次 final_norm +
+        # decoder),即训练时 post_dit 见到的是双重 norm 特征;本缓存路径
+        # 原先直接 return,post_dit 只见一次 norm → eval 分布 ≠ 训练分布。
+        # action = action_expert.final_norm(action)
         return action
 
     def _forward_mage_flow(self, embeds_all, context_all):
@@ -1490,6 +1563,29 @@ class MoT(nn.Module):
             if mid_enabled and idx == mid_layer_index:
                 mid_hidden = video
 
+        # Delta-dynamics anchor: the FINAL-layer reference-token HIDDEN features
+        # (pre norm_out/proj_out). NOTE: the image stream tensor is IMAGE-ONLY
+        # (text flows separately), so sample b's ref tokens are at
+        # img_cu[b] + target_len — NO text offset (unlike the addr ref_index,
+        # which addresses the text+image concatenated qkv stream).
+        ref_hidden = None
+        if self.return_ref_hidden:
+            _icu = [int(x) for x in vcu.tolist()]
+            _target_len = int(video_state["target_len"])
+            _ref_len = (_icu[1] - _icu[0]) - _target_len
+            _B = int(video_state["batch_size"])
+            _idx = torch.cat([
+                torch.arange(_icu[b] + _target_len,
+                             _icu[b] + _target_len + _ref_len,
+                             device=video.device)
+                for b in range(_B)])
+
+            def _slice(src):
+                return src[0, _idx].view(_B, _ref_len, -1).contiguous()
+
+            # delta / delta_tol 共用:末层输出切片(v1 原位,逐位向后兼容)。
+            ref_hidden = _slice(video)
+
         norm_temb = vtemb[0] if isinstance(vtemb, tuple) else vtemb
         video = vtr.norm_out(video, norm_temb, cu_seqlens=vcu)
         video = vtr.proj_out(video).reshape(
@@ -1497,6 +1593,8 @@ class MoT(nn.Module):
         action = action_expert.final_norm(action).reshape(
             int(action_state["batch_size"]), -1, action_expert.hidden_dim)
         out = {"video": video, "action": action}
+        if ref_hidden is not None:
+            out["ref_hidden"] = ref_hidden
         if mid_hidden is not None:
             # Auxiliary velocity prediction from the l-th video block (ReWorld
             # Eq.6). Same norm+proj parameterization and reshape as the main head.
